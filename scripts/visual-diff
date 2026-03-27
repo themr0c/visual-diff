@@ -24,7 +24,7 @@ if not _venv_python.is_file():
     subprocess.check_call([str(_venv_python), '-m', 'pip', 'install', '-q', '-r', str(_requirements)])
     subprocess.check_call([str(_repo_root / 'venv' / 'bin' / 'playwright'), 'install', 'firefox'])
 
-if Path(sys.executable).resolve() != _venv_python.resolve():
+if _venv_python.is_file() and not sys.prefix.startswith(str(_repo_root / 'venv')):
     os.execv(str(_venv_python), [str(_venv_python), str(_script)] + sys.argv[1:])
 
 # Load .env if present
@@ -43,7 +43,7 @@ import argparse
 
 from playwright.sync_api import sync_playwright
 
-SESSION_DIR = "/tmp/pantheon-session"
+SESSION_DIR = str(Path(__file__).resolve().parent.parent / '.cache' / 'pantheon-session')
 
 CONTENT_BASE = {
     'preview': 'https://content-preview.docs.redhat.com',
@@ -161,13 +161,14 @@ def extract_title_slug(url, product, version):
 
 
 def scrape_chapter_links(page, title_url, product, version, title_slug):
-    """Scrape chapter links from a title landing page.
+    """Scrape chapter links from a title's left-nav/TOC sidebar.
 
-    Returns list of (chapter_name, href) for all chapters in this title.
-    Uses a seen set to deduplicate.
+    Returns list of (chapter_name, href) for real chapters only.
+    Filters out language selectors, skip-to links, legal notices, and
+    other non-chapter navigation elements.
     """
     page.goto(title_url, wait_until="networkidle", timeout=60000)
-    time.sleep(3)
+    time.sleep(2)
     _dismiss_overlays(page)
 
     # Match links like /{product}/{version}/html/{title_slug}/{chapter}
@@ -175,11 +176,42 @@ def scrape_chapter_links(page, title_url, product, version, title_slug):
     links = page.evaluate("""(pattern) => {
         const results = [];
         const seen = new Set();
-        for (const a of document.querySelectorAll('a')) {
+
+        // Target TOC/nav sidebar links only
+        const navSelectors = [
+            '.pf-c-nav__list a',
+            '.pf-v5-c-nav__list a',
+            'nav a',
+            '[role="navigation"] a',
+            '.toc a',
+            '#toc a',
+        ];
+
+        let anchors = [];
+        for (const sel of navSelectors) {
+            const found = document.querySelectorAll(sel);
+            if (found.length > 0) {
+                anchors = found;
+                break;
+            }
+        }
+        // Fallback to all links if no nav container found
+        if (anchors.length === 0) {
+            anchors = document.querySelectorAll('a');
+        }
+
+        // Junk patterns to exclude
+        const junkPatterns = [
+            /skip.to/i, /legal.notice/i, /^(deutsch|english|español|français|italiano|português)$/i,
+            /^日本語$/, /^한국어$/, /^中文/, /^preface$/i,
+            /^(next|previous|prev)$/i, /^(back to top|table of contents)$/i,
+        ];
+
+        for (const a of anchors) {
             if (a.href.includes(pattern)) {
                 const name = a.textContent.trim();
-                const href = a.href;
-                if (name && !seen.has(href)) {
+                const href = a.href.split('#')[0];  // Normalize anchors
+                if (name && !seen.has(href) && !junkPatterns.some(p => p.test(name))) {
                     results.push({name, href});
                     seen.add(href);
                 }
@@ -209,20 +241,29 @@ def open_browser(fresh=False, headless=False):
     return p, browser, page
 
 
+def _get_text_hash(page):
+    """Get a hash of the visible text content for quick identity check."""
+    import hashlib
+    text = page.evaluate("""() => {
+        const el = document.querySelector('#app-content') || document.body;
+        return el.innerText;
+    }""")
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
 def _full_page_screenshot(page, path):
     """Take a full-page screenshot.
 
     Red Hat docs pages use a fixed-height layout with a scrollable inner
     container (#app-content). We expand all scrollable containers to their
-    full scroll height, resize the viewport to match, take the screenshot,
-    then restore everything.
+    full scroll height, resize the viewport to match, and take the screenshot.
     """
     # Scroll the main content container to trigger lazy loading
     page.evaluate("""() => {
         const container = document.querySelector('#app-content') || document.body;
         return new Promise((resolve) => {
             let totalHeight = 0;
-            const distance = 1000;
+            const distance = 2000;
             const timer = setInterval(() => {
                 container.scrollBy(0, distance);
                 totalHeight += distance;
@@ -231,14 +272,12 @@ def _full_page_screenshot(page, path):
                     container.scrollTo(0, 0);
                     resolve();
                 }
-            }, 100);
+            }, 50);
         });
     }""")
-    time.sleep(1)
 
     # Expand scrollable containers and get full height
     full_height = page.evaluate("""() => {
-        // Find the tallest scrollable container
         let maxH = document.documentElement.scrollHeight;
         for (const el of document.querySelectorAll('*')) {
             if (el.scrollHeight > el.clientHeight + 50) {
@@ -248,7 +287,6 @@ def _full_page_screenshot(page, path):
                 maxH = Math.max(maxH, el.scrollHeight);
             }
         }
-        // Also expand html/body
         document.documentElement.style.overflow = 'visible';
         document.documentElement.style.height = 'auto';
         document.body.style.overflow = 'visible';
@@ -256,11 +294,9 @@ def _full_page_screenshot(page, path):
         return Math.max(maxH, document.documentElement.scrollHeight, document.body.scrollHeight);
     }""")
 
-    # Resize viewport to full content height
+    # Resize viewport to full content height (no reset — kept expanded)
     page.set_viewport_size({"width": 1400, "height": full_height})
-    time.sleep(0.5)
     page.screenshot(path=str(path))
-    page.set_viewport_size({"width": 1400, "height": 900})
 
 
 def slugify(name):
@@ -331,11 +367,14 @@ def compare_screenshots(a_path, b_path, output_dir, slug):
     - Original pixels in changed regions
     - Red borders (3px) around changed region bounding boxes
 
+    Uses numpy for fast vectorized pixel operations.
+
     Files created:
     - {slug}_a_annotated.png
     - {slug}_b_annotated.png
     """
-    from PIL import Image, ImageChops, ImageDraw
+    import numpy as np
+    from PIL import Image, ImageDraw
 
     img_a = Image.open(a_path).convert('RGB')
     img_b = Image.open(b_path).convert('RGB')
@@ -352,43 +391,39 @@ def compare_screenshots(a_path, b_path, output_dir, slug):
         canvas.paste(img_b, (0, 0))
         img_b = canvas
 
-    # Check for differences
-    diff_img = ImageChops.difference(img_a, img_b)
-    if diff_img.getbbox() is None:
+    arr_a = np.array(img_a)
+    arr_b = np.array(img_b)
+
+    # Vectorized diff: sum of absolute channel differences per pixel
+    diff = np.abs(arr_a.astype(np.int16) - arr_b.astype(np.int16)).sum(axis=2)
+    changed_mask = diff > 30
+
+    if not changed_mask.any():
         return 'identical', 0.0
 
-    # Find changed pixels using grid cells
-    cell_size = 50
-    changed_cells = set()
-    diff_px = diff_img.load()
     total_pixels = max_w * max_h
-    changed_pixels = 0
+    changed_pixels = int(changed_mask.sum())
+    change_pct = (changed_pixels / total_pixels * 100)
 
-    for y in range(max_h):
-        for x in range(max_w):
-            r, g, b = diff_px[x, y]
-            if r + g + b > 30:
-                changed_pixels += 1
-                cell_x = x // cell_size
-                cell_y = y // cell_size
-                changed_cells.add((cell_x, cell_y))
-
-    change_pct = (changed_pixels / total_pixels * 100) if total_pixels > 0 else 0
+    # Find changed grid cells using numpy
+    cell_size = 50
+    ys, xs = np.nonzero(changed_mask)
+    cell_coords = np.column_stack((xs // cell_size, ys // cell_size))
+    changed_cells = set(map(tuple, np.unique(cell_coords, axis=0)))
 
     # Merge cells into bounding boxes
     bboxes = _merge_cells_to_bboxes(changed_cells, cell_size, max_w, max_h, padding=10)
 
-    # Create annotated images
-    for img, suffix in [(img_a, 'a'), (img_b, 'b')]:
-        # Dim entire image (blend with white at 40%)
-        white = Image.new('RGB', img.size, (255, 255, 255))
-        dimmed = Image.blend(img, white, 0.4)
+    # Create annotated images using numpy
+    for arr, suffix in [(arr_a, 'a'), (arr_b, 'b')]:
+        # Dim entire image: blend with white at 40%
+        dimmed = (arr.astype(np.float32) * 0.6 + 255 * 0.4).astype(np.uint8)
 
         # Paste original pixels back in changed regions
-        annotated = dimmed.copy()
         for x1, y1, x2, y2 in bboxes:
-            region = img.crop((x1, y1, x2, y2))
-            annotated.paste(region, (x1, y1))
+            dimmed[y1:y2, x1:x2] = arr[y1:y2, x1:x2]
+
+        annotated = Image.fromarray(dimmed)
 
         # Draw red borders around bboxes
         draw = ImageDraw.Draw(annotated)
@@ -399,7 +434,6 @@ def compare_screenshots(a_path, b_path, output_dir, slug):
                     outline=(255, 0, 0)
                 )
 
-        # Save
         out_path = output_dir / f"{slug}_{suffix}_annotated.png"
         annotated.save(str(out_path))
 
@@ -804,9 +838,14 @@ def cmd_diff(args):
             label_a = "Env A"
             label_b = "Env B"
 
-        # Screenshot and compare each item
+        # Screenshot and compare each item using two tabs
         print(f"\nComparing {len(comparisons)} pages\n")
         summary = []
+        # Open second tab via JavaScript (persistent context doesn't support new_page())
+        page.evaluate("window.open('about:blank')")
+        page_b = browser.pages[-1]
+        page_b.set_viewport_size({"width": 1400, "height": 900})
+
         for i, item in enumerate(comparisons):
             title = item['title']
             chapter = item.get('chapter')
@@ -838,19 +877,30 @@ def cmd_diff(args):
                 continue
 
             try:
-                # Screenshot A
+                # Navigate both tabs in parallel
                 page.goto(a_url, wait_until="networkidle", timeout=120000)
-                time.sleep(3)
+                page_b.goto(b_url, wait_until="networkidle", timeout=120000)
+                time.sleep(1)
                 _dismiss_overlays(page)
+                _dismiss_overlays(page_b)
+
+                # Quick text hash comparison to skip identical pages
+                hash_a = _get_text_hash(page)
+                hash_b = _get_text_hash(page_b)
+                if hash_a == hash_b:
+                    print("  identical (text match)")
+                    item['slug'] = slug
+                    item['status'] = 'identical'
+                    item['change_pct'] = 0.0
+                    summary.append(item)
+                    continue
+
+                # Text differs — take full screenshots
                 a_path = output_dir / f"{slug}_a.png"
                 _full_page_screenshot(page, a_path)
 
-                # Screenshot B
-                page.goto(b_url, wait_until="networkidle", timeout=120000)
-                time.sleep(3)
-                _dismiss_overlays(page)
                 b_path = output_dir / f"{slug}_b.png"
-                _full_page_screenshot(page, b_path)
+                _full_page_screenshot(page_b, b_path)
 
                 # Compare
                 status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
@@ -870,7 +920,7 @@ def cmd_diff(args):
                 item['detail'] = str(e)
                 summary.append(item)
 
-            time.sleep(1)
+        page_b.close()
 
         generate_report(output_dir, summary, label_a, label_b)
         changed = sum(1 for s in summary if s.get('status') == 'changed')
