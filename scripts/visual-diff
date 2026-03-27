@@ -96,6 +96,51 @@ def scrape_title_links(page, url, product, version):
     return [(l['name'], l['href']) for l in links]
 
 
+def extract_title_slug(url, product, version):
+    """Extract the title slug from a Pantheon URL.
+
+    Example: .../red_hat_developer_hub/1.9/html/about_red_hat_developer_hub/index
+             -> 'about_red_hat_developer_hub'
+    """
+    pattern = f"/{product}/{version}/html/"
+    if pattern in url:
+        after = url.split(pattern)[1]
+        # Take first segment after /html/
+        slug = after.split('/')[0]
+        return slug
+    return None
+
+
+def scrape_chapter_links(page, title_url, product, version, title_slug):
+    """Scrape chapter links from a title landing page.
+
+    Returns list of (chapter_name, href) for all chapters in this title.
+    Uses a seen set to deduplicate.
+    """
+    page.goto(title_url, wait_until="networkidle", timeout=60000)
+    time.sleep(3)
+    _dismiss_overlays(page)
+
+    # Match links like /{product}/{version}/html/{title_slug}/{chapter}
+    pattern = f"/{product}/{version}/html/{title_slug}/"
+    links = page.evaluate("""(pattern) => {
+        const results = [];
+        const seen = new Set();
+        for (const a of document.querySelectorAll('a')) {
+            if (a.href.includes(pattern)) {
+                const name = a.textContent.trim();
+                const href = a.href;
+                if (name && !seen.has(href)) {
+                    results.push({name, href});
+                    seen.add(href);
+                }
+            }
+        }
+        return results;
+    }""", pattern)
+    return [(l['name'], l['href']) for l in links]
+
+
 def open_browser(fresh=False, headless=False):
     """Launch Firefox with Kerberos SPNEGO for content sites."""
     if fresh and os.path.exists(SESSION_DIR):
@@ -179,105 +224,329 @@ def slugify(name):
 # Screenshot comparison
 # ---------------------------------------------------------------------------
 
-def compare_screenshots(stage_path, preview_path, diff_path):
-    """Compare two screenshots pixel-by-pixel.
+def _merge_cells_to_bboxes(cells, cell_size, max_w, max_h, padding=10):
+    """Merge adjacent grid cells into bounding boxes with padding.
 
-    Returns 'identical' or 'changed'. If changed, writes a diff overlay
-    to diff_path with changed pixels highlighted in red.
+    Args:
+        cells: Set of (cell_x, cell_y) tuples representing changed grid cells
+        cell_size: Size of each grid cell in pixels
+        max_w, max_h: Image dimensions
+        padding: Pixels to expand each bbox
+
+    Returns:
+        List of (x1, y1, x2, y2) bounding box tuples
     """
-    from PIL import Image, ImageChops
+    if not cells:
+        return []
 
-    img_stage = Image.open(stage_path).convert('RGB')
-    img_preview = Image.open(preview_path).convert('RGB')
+    # Convert cells to pixel coordinates
+    pixel_rects = []
+    for cx, cy in cells:
+        x1 = cx * cell_size
+        y1 = cy * cell_size
+        x2 = min(x1 + cell_size, max_w)
+        y2 = min(y1 + cell_size, max_h)
+        pixel_rects.append((x1, y1, x2, y2))
+
+    # Merge overlapping/adjacent rectangles
+    merged = []
+    for rect in pixel_rects:
+        x1, y1, x2, y2 = rect
+        # Expand by padding
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(max_w, x2 + padding)
+        y2 = min(max_h, y2 + padding)
+
+        # Try to merge with existing boxes
+        did_merge = False
+        for i, (mx1, my1, mx2, my2) in enumerate(merged):
+            # Check if rectangles overlap or are adjacent
+            if not (x2 < mx1 or x1 > mx2 or y2 < my1 or y1 > my2):
+                # Merge
+                merged[i] = (min(x1, mx1), min(y1, my1), max(x2, mx2), max(y2, my2))
+                did_merge = True
+                break
+        if not did_merge:
+            merged.append((x1, y1, x2, y2))
+
+    return merged
+
+
+def compare_screenshots(a_path, b_path, output_dir, slug):
+    """Compare two screenshots and create annotated versions.
+
+    Returns (status, change_pct) tuple where status is 'identical' or 'changed'.
+    If changed, creates annotated screenshots with:
+    - Dimmed unchanged areas (40% blend with white)
+    - Original pixels in changed regions
+    - Red borders (3px) around changed region bounding boxes
+
+    Files created:
+    - {slug}_a_annotated.png
+    - {slug}_b_annotated.png
+    """
+    from PIL import Image, ImageChops, ImageDraw
+
+    img_a = Image.open(a_path).convert('RGB')
+    img_b = Image.open(b_path).convert('RGB')
 
     # Pad to same dimensions
-    max_w = max(img_stage.width, img_preview.width)
-    max_h = max(img_stage.height, img_preview.height)
-    if img_stage.size != (max_w, max_h):
+    max_w = max(img_a.width, img_b.width)
+    max_h = max(img_a.height, img_b.height)
+    if img_a.size != (max_w, max_h):
         canvas = Image.new('RGB', (max_w, max_h), (255, 255, 255))
-        canvas.paste(img_stage, (0, 0))
-        img_stage = canvas
-    if img_preview.size != (max_w, max_h):
+        canvas.paste(img_a, (0, 0))
+        img_a = canvas
+    if img_b.size != (max_w, max_h):
         canvas = Image.new('RGB', (max_w, max_h), (255, 255, 255))
-        canvas.paste(img_preview, (0, 0))
-        img_preview = canvas
+        canvas.paste(img_b, (0, 0))
+        img_b = canvas
 
-    diff_img = ImageChops.difference(img_stage, img_preview)
+    # Check for differences
+    diff_img = ImageChops.difference(img_a, img_b)
     if diff_img.getbbox() is None:
-        return 'identical'
+        return 'identical', 0.0
 
-    # Create diff overlay
-    overlay = img_preview.copy()
+    # Find changed pixels using grid cells
+    cell_size = 50
+    changed_cells = set()
     diff_px = diff_img.load()
-    over_px = overlay.load()
+    total_pixels = max_w * max_h
+    changed_pixels = 0
+
     for y in range(max_h):
         for x in range(max_w):
             r, g, b = diff_px[x, y]
             if r + g + b > 30:
-                over_px[x, y] = (255, 0, 0)
-    overlay.save(str(diff_path))
-    return 'changed'
+                changed_pixels += 1
+                cell_x = x // cell_size
+                cell_y = y // cell_size
+                changed_cells.add((cell_x, cell_y))
+
+    change_pct = (changed_pixels / total_pixels * 100) if total_pixels > 0 else 0
+
+    # Merge cells into bounding boxes
+    bboxes = _merge_cells_to_bboxes(changed_cells, cell_size, max_w, max_h, padding=10)
+
+    # Create annotated images
+    for img, suffix in [(img_a, 'a'), (img_b, 'b')]:
+        # Dim entire image (blend with white at 40%)
+        white = Image.new('RGB', img.size, (255, 255, 255))
+        dimmed = Image.blend(img, white, 0.4)
+
+        # Paste original pixels back in changed regions
+        annotated = dimmed.copy()
+        for x1, y1, x2, y2 in bboxes:
+            region = img.crop((x1, y1, x2, y2))
+            annotated.paste(region, (x1, y1))
+
+        # Draw red borders around bboxes
+        draw = ImageDraw.Draw(annotated)
+        for x1, y1, x2, y2 in bboxes:
+            for offset in range(3):
+                draw.rectangle(
+                    [x1 + offset, y1 + offset, x2 - offset - 1, y2 - offset - 1],
+                    outline=(255, 0, 0)
+                )
+
+        # Save
+        out_path = output_dir / f"{slug}_{suffix}_annotated.png"
+        annotated.save(str(out_path))
+
+    return 'changed', change_pct
 
 
 # ---------------------------------------------------------------------------
 # HTML report
 # ---------------------------------------------------------------------------
 
-def generate_report(output_dir, summary, product, version):
-    """Generate an HTML report for the visual diff."""
-    rows = []
-    for s in summary:
-        slug = s['slug']
-        status = s['status']
-        if status == 'identical':
-            badge = '<span style="color:green">identical</span>'
-            detail = ''
-        elif status == 'changed':
-            badge = '<span style="color:red;font-weight:bold">CHANGED</span>'
-            detail = f'<a href="#{slug}">view diff</a>'
-        elif status == 'error':
-            badge = '<span style="color:orange">error</span>'
-            detail = s.get('detail', '')
-        else:
-            badge = '<span style="color:gray">skipped</span>'
-            detail = s.get('detail', '')
-        rows.append(f'<tr><td>{s["name"]}</td><td>{badge}</td><td>{detail}</td></tr>')
+def generate_report(output_dir, summary, label_a="Environment A", label_b="Environment B"):
+    """Generate an HTML report with collapsible title sections."""
+    from collections import OrderedDict
 
-    details = []
+    # Group results by title
+    by_title = OrderedDict()
     for s in summary:
-        if s['status'] != 'changed':
+        title = s.get('title', s.get('name', 'Unknown'))
+        if title not in by_title:
+            by_title[title] = []
+        by_title[title].append(s)
+
+    # Build summary table
+    rows = []
+    for title, items in by_title.items():
+        for s in items:
+            chapter = s.get('chapter', '')
+            status = s.get('status', 'unknown')
+            slug = s.get('slug', slugify(title))
+
+            if status == 'identical':
+                badge = '<span class="badge-identical">identical</span>'
+                detail = ''
+            elif status == 'changed':
+                change_pct = s.get('change_pct', 0)
+                badge = f'<span class="badge-changed">CHANGED ({change_pct:.1f}%)</span>'
+                detail = f'<a href="#{slug}">view</a>'
+            elif status == 'error':
+                badge = '<span class="badge-error">error</span>'
+                detail = s.get('detail', '')
+            else:
+                badge = '<span class="badge-skipped">skipped</span>'
+                detail = s.get('detail', '')
+
+            chapter_cell = chapter if chapter else '<em>(index)</em>'
+            rows.append(f'<tr><td>{title}</td><td>{chapter_cell}</td><td>{badge}</td><td>{detail}</td></tr>')
+
+    # Build detail sections grouped by title
+    details = []
+    for title, items in by_title.items():
+        changed_items = [s for s in items if s.get('status') == 'changed']
+        if not changed_items:
             continue
-        slug = s['slug']
-        details.append(f'''
-        <h2 id="{slug}">{s["name"]}</h2>
-        <p>
-          <a href="{s.get('stage_url', '')}" target="_blank">Stage</a> |
-          <a href="{s.get('preview_url', '')}" target="_blank">Preview</a>
-        </p>
-        <div style="display:flex;gap:20px;flex-wrap:wrap">
-          <div><h3>Stage</h3><img src="{slug}_stage.png" style="max-width:45vw;border:1px solid #ccc"></div>
-          <div><h3>Preview</h3><img src="{slug}_preview.png" style="max-width:45vw;border:1px solid #ccc"></div>
-        </div>
-        <div><h3>Diff overlay</h3><img src="{slug}_diff.png" style="max-width:90vw;border:1px solid #ccc"></div>
-        <hr>
-        ''')
+
+        details.append(f'<details open><summary class="title-summary">{title}</summary>')
+
+        for s in changed_items:
+            slug = s.get('slug', '')
+            chapter = s.get('chapter', '')
+            change_pct = s.get('change_pct', 0)
+            a_url = s.get('a_url', '')
+            b_url = s.get('b_url', '')
+
+            chapter_title = f"{title} / {chapter}" if chapter else title
+
+            details.append(f'''
+            <div class="chapter-section" id="{slug}">
+              <h3>{chapter_title}</h3>
+              <p class="meta">
+                Change: {change_pct:.2f}% |
+                <a href="{a_url}" target="_blank">{label_a}</a> |
+                <a href="{b_url}" target="_blank">{label_b}</a>
+              </p>
+              <div class="screenshot-grid">
+                <div class="screenshot-col">
+                  <h4>{label_a}</h4>
+                  <img src="{slug}_a_annotated.png" alt="{label_a}">
+                </div>
+                <div class="screenshot-col">
+                  <h4>{label_b}</h4>
+                  <img src="{slug}_b_annotated.png" alt="{label_b}">
+                </div>
+              </div>
+            </div>
+            ''')
+
+        details.append('</details>')
 
     html = f'''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Visual Diff: {product} {version}</title>
+<title>Visual Diff Report</title>
 <style>
-  body {{ font-family: sans-serif; margin: 20px; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-  th {{ background: #f5f5f5; }}
-  img {{ max-height: 600px; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 20px;
+    background: #f6f8fa;
+  }}
+  h1 {{
+    color: #24292e;
+    border-bottom: 2px solid #e1e4e8;
+    padding-bottom: 10px;
+  }}
+  table {{
+    border-collapse: collapse;
+    width: 100%;
+    background: white;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    margin: 20px 0;
+  }}
+  th, td {{
+    border: 1px solid #e1e4e8;
+    padding: 12px;
+    text-align: left;
+  }}
+  th {{
+    background: #f6f8fa;
+    font-weight: 600;
+    color: #24292e;
+  }}
+  .badge-identical {{ color: #28a745; font-weight: 500; }}
+  .badge-changed {{ color: #d73a49; font-weight: 700; }}
+  .badge-error {{ color: #e36209; font-weight: 500; }}
+  .badge-skipped {{ color: #6a737d; font-weight: 500; }}
+
+  details {{
+    background: white;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    margin: 20px 0;
+    padding: 0;
+  }}
+  .title-summary {{
+    font-size: 1.2em;
+    font-weight: 600;
+    padding: 15px;
+    cursor: pointer;
+    color: #0366d6;
+    border-bottom: 1px solid #e1e4e8;
+  }}
+  .title-summary:hover {{
+    background: #f6f8fa;
+  }}
+  .chapter-section {{
+    padding: 20px;
+    border-bottom: 1px solid #e1e4e8;
+  }}
+  .chapter-section:last-child {{
+    border-bottom: none;
+  }}
+  .chapter-section h3 {{
+    margin-top: 0;
+    color: #24292e;
+  }}
+  .meta {{
+    color: #6a737d;
+    font-size: 0.9em;
+    margin: 10px 0;
+  }}
+  .meta a {{
+    color: #0366d6;
+    text-decoration: none;
+  }}
+  .meta a:hover {{
+    text-decoration: underline;
+  }}
+  .screenshot-grid {{
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-top: 15px;
+  }}
+  .screenshot-col {{
+    flex: 1;
+    min-width: 400px;
+  }}
+  .screenshot-col h4 {{
+    margin: 0 0 10px 0;
+    color: #586069;
+    font-size: 0.95em;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }}
+  .screenshot-col img {{
+    max-width: 100%;
+    border: 1px solid #e1e4e8;
+    border-radius: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }}
 </style></head><body>
-<h1>Visual Diff: {product} {version} (stage vs preview)</h1>
+<h1>Visual Diff Report</h1>
+<p style="color: #586069;">Comparing <strong>{label_a}</strong> vs <strong>{label_b}</strong></p>
 <table>
-<tr><th>Title</th><th>Status</th><th>Details</th></tr>
+<tr><th>Title</th><th>Chapter</th><th>Status</th><th>Details</th></tr>
 {"".join(rows)}
 </table>
-<hr>
+<hr style="border: none; border-top: 2px solid #e1e4e8; margin: 30px 0;">
 {"".join(details)}
 </body></html>'''
 
@@ -328,7 +597,7 @@ def cmd_urls(args):
 
 
 def cmd_diff(args):
-    """Generate visual diff between stage and preview builds."""
+    """Generate visual diff between two environments."""
     try:
         from PIL import Image  # noqa: F401
     except ImportError:
@@ -340,77 +609,193 @@ def cmd_diff(args):
     p, browser, page = open_browser(args.fresh, args.headless)
 
     try:
-        preview = splash_url('preview', args.product, args.version)
-        stage = splash_url('stage', args.product, args.version)
+        if args.mode == "pantheon":
+            # Pantheon mode: crawl chapters for each title
+            preview = splash_url('preview', args.product, args.version)
+            stage = splash_url('stage', args.product, args.version)
 
-        print(f"Scraping preview: {preview}")
-        preview_links = scrape_title_links(page, preview, args.product, args.version)
-        print(f"Scraping stage:   {stage}")
-        stage_links = scrape_title_links(page, stage, args.product, args.version)
+            print(f"Scraping preview: {preview}")
+            preview_links = scrape_title_links(page, preview, args.product, args.version)
+            print(f"Scraping stage:   {stage}")
+            stage_links = scrape_title_links(page, stage, args.product, args.version)
 
-        stage_by_name = dict(stage_links)
-        preview_by_name = dict(preview_links)
-        all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+            stage_by_name = dict(stage_links)
+            preview_by_name = dict(preview_links)
+            all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
 
-        if args.title:
-            all_names = [n for n in all_names
-                         if any(t.lower() in n.lower() for t in args.title)]
+            if args.title:
+                all_names = [n for n in all_names
+                             if any(t.lower() in n.lower() for t in args.title)]
 
-        print(f"\nComparing {len(all_names)} titles (stage vs preview)\n")
+            # Build list of (title_name, chapter_name, a_url, b_url) items
+            comparisons = []
+            for title_name in all_names:
+                stage_title_url = stage_by_name.get(title_name, '')
+                preview_title_url = preview_by_name.get(title_name, '')
 
+                if not stage_title_url or not preview_title_url:
+                    missing = 'stage' if not stage_title_url else 'preview'
+                    comparisons.append({
+                        'title': title_name,
+                        'chapter': None,
+                        'a_url': stage_title_url,
+                        'b_url': preview_title_url,
+                        'status': 'skipped',
+                        'detail': f'No {missing} URL'
+                    })
+                    continue
+
+                # Extract title slug and crawl chapters
+                title_slug = extract_title_slug(stage_title_url, args.product, args.version)
+                if not title_slug:
+                    comparisons.append({
+                        'title': title_name,
+                        'chapter': None,
+                        'a_url': stage_title_url,
+                        'b_url': preview_title_url,
+                        'status': 'error',
+                        'detail': 'Could not extract title slug'
+                    })
+                    continue
+
+                try:
+                    # Scrape chapters from stage
+                    stage_chapters = scrape_chapter_links(page, stage_title_url,
+                                                         args.product, args.version, title_slug)
+                    preview_chapters = scrape_chapter_links(page, preview_title_url,
+                                                           args.product, args.version, title_slug)
+
+                    stage_ch_by_name = dict(stage_chapters)
+                    preview_ch_by_name = dict(preview_chapters)
+                    all_chapters = sorted(set(list(stage_ch_by_name) + list(preview_ch_by_name)))
+
+                    for chapter_name in all_chapters:
+                        comparisons.append({
+                            'title': title_name,
+                            'chapter': chapter_name,
+                            'a_url': stage_ch_by_name.get(chapter_name, ''),
+                            'b_url': preview_ch_by_name.get(chapter_name, ''),
+                        })
+
+                except Exception as e:
+                    comparisons.append({
+                        'title': title_name,
+                        'chapter': None,
+                        'a_url': stage_title_url,
+                        'b_url': preview_title_url,
+                        'status': 'error',
+                        'detail': f'Chapter crawl failed: {e}'
+                    })
+
+            label_a = "Stage"
+            label_b = "Preview"
+
+        else:
+            # PR mode: simple per-title comparison (no chapter crawling)
+            # For now, this is a placeholder - full PR mode implementation would go here
+            comparisons = []
+            label_a = "Build A"
+            label_b = "Build B"
+
+        # Screenshot and compare each item
+        print(f"\nComparing {len(comparisons)} pages\n")
         summary = []
-        for i, name in enumerate(all_names):
-            s_url = stage_by_name.get(name, '')
-            p_url = preview_by_name.get(name, '')
-            slug = slugify(name)
+        for i, item in enumerate(comparisons):
+            title = item['title']
+            chapter = item.get('chapter')
+            a_url = item.get('a_url', '')
+            b_url = item.get('b_url', '')
 
-            print(f"[{i+1}/{len(all_names)}] {name}")
+            # Check for pre-existing errors
+            if 'status' in item:
+                print(f"[{i+1}/{len(comparisons)}] {title} / {chapter or '(index)'}: {item['status']}")
+                summary.append(item)
+                continue
 
-            if not s_url or not p_url:
-                missing = 'stage' if not s_url else 'preview'
+            # Build slug from title + chapter
+            if chapter:
+                slug = slugify(f"{title}_{chapter}")
+                display_name = f"{title} / {chapter}"
+            else:
+                slug = slugify(title)
+                display_name = title
+
+            print(f"[{i+1}/{len(comparisons)}] {display_name}")
+
+            if not a_url or not b_url:
+                missing = 'A' if not a_url else 'B'
                 print(f"  SKIP: no {missing} URL")
-                summary.append({'name': name, 'slug': slug, 'status': 'skipped',
-                                'detail': f'No {missing} URL'})
+                item['status'] = 'skipped'
+                item['detail'] = f'No {missing} URL'
+                summary.append(item)
                 continue
 
             try:
-                # Screenshot stage
-                page.goto(s_url, wait_until="networkidle", timeout=120000)
+                # Screenshot A
+                page.goto(a_url, wait_until="networkidle", timeout=120000)
                 time.sleep(3)
                 _dismiss_overlays(page)
-                stage_path = output_dir / f"{slug}_stage.png"
-                _full_page_screenshot(page, stage_path)
+                a_path = output_dir / f"{slug}_a.png"
+                _full_page_screenshot(page, a_path)
 
-                # Screenshot preview
-                page.goto(p_url, wait_until="networkidle", timeout=120000)
+                # Screenshot B
+                page.goto(b_url, wait_until="networkidle", timeout=120000)
                 time.sleep(3)
                 _dismiss_overlays(page)
-                preview_path = output_dir / f"{slug}_preview.png"
-                _full_page_screenshot(page, preview_path)
+                b_path = output_dir / f"{slug}_b.png"
+                _full_page_screenshot(page, b_path)
 
                 # Compare
-                diff_path = output_dir / f"{slug}_diff.png"
-                status = compare_screenshots(stage_path, preview_path, diff_path)
+                status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
                 print(f"  {status.upper() if status == 'changed' else status}")
+                if status == 'changed':
+                    print(f"  {change_pct:.2f}% changed")
 
-                summary.append({
-                    'name': name, 'slug': slug, 'status': status,
-                    'stage_url': s_url, 'preview_url': p_url,
-                })
+                item['slug'] = slug
+                item['status'] = status
+                item['change_pct'] = change_pct
+                summary.append(item)
 
             except Exception as e:
                 print(f"  ERROR: {e}")
-                summary.append({'name': name, 'slug': slug, 'status': 'error',
-                                'detail': str(e)})
+                item['slug'] = slug
+                item['status'] = 'error'
+                item['detail'] = str(e)
+                summary.append(item)
 
             time.sleep(1)
 
-        generate_report(output_dir, summary, args.product, args.version)
-        changed = sum(1 for s in summary if s['status'] == 'changed')
-        identical = sum(1 for s in summary if s['status'] == 'identical')
-        errors = sum(1 for s in summary if s['status'] in ('error', 'skipped'))
+        generate_report(output_dir, summary, label_a, label_b)
+        changed = sum(1 for s in summary if s.get('status') == 'changed')
+        identical = sum(1 for s in summary if s.get('status') == 'identical')
+        errors = sum(1 for s in summary if s.get('status') in ('error', 'skipped'))
         print(f"\nDone. Changed: {changed}, Identical: {identical}, Errors: {errors}")
         print(f"Report: {output_dir / 'index.html'}")
+
+        # Optional JSON output
+        if args.output_json:
+            json_path = output_dir / 'results.json'
+            json_path.write_text(json.dumps(summary, indent=2))
+            print(f"JSON:   {json_path}")
+
+        # Optional Markdown output
+        if args.output_markdown:
+            md_lines = ["# Visual Diff Summary\n"]
+            for s in summary:
+                if s.get('status') == 'changed':
+                    title = s.get('title', 'Unknown')
+                    chapter = s.get('chapter')
+                    slug = s.get('slug', '')
+                    change_pct = s.get('change_pct', 0)
+                    display = f"{title} / {chapter}" if chapter else title
+                    md_lines.append(f"## {display}\n")
+                    md_lines.append(f"- Change: {change_pct:.2f}%\n")
+                    md_lines.append(f"- Annotated A: `{slug}_a_annotated.png`\n")
+                    md_lines.append(f"- Annotated B: `{slug}_b_annotated.png`\n")
+                    md_lines.append("\n")
+            md_path = output_dir / 'summary.md'
+            md_path.write_text("".join(md_lines))
+            print(f"Markdown: {md_path}")
 
     finally:
         browser.close()
@@ -423,30 +808,34 @@ def cmd_diff(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visual diff between stage and preview docs builds",
+        description="Visual diff tool for Red Hat documentation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Prerequisites:
+Modes:
+  pantheon - Compare Pantheon stage vs preview environments
+  pr       - Compare two PR build environments (A vs B)
+
+Prerequisites (Pantheon mode):
   - Valid Kerberos ticket (run 'kinit' first)
   - VPN connection to Red Hat network
   - Playwright Firefox (installed via setup.sh)
 
-Examples:
-  visual-diff urls --version 1.9
-  visual-diff diff --version 1.9 --output /tmp/rhdh-1.9-diff/
-  visual-diff diff --version 1.9 --title "About" --output /tmp/rhdh-diff/
+Examples (Pantheon mode):
+  visual-diff urls --pantheon-version 1.9
+  visual-diff diff --pantheon-version 1.9 --output /tmp/rhdh-1.9-diff/
+  visual-diff diff --pantheon-version 1.9 --title "About" --output /tmp/rhdh-diff/
+
+Examples (PR mode):
+  visual-diff diff --mode pr --env-a build-a --env-b build-b --output /tmp/pr-diff/
 """,
     )
 
+    parser.add_argument(
+        "--mode", choices=["pantheon", "pr"],
+        help="Comparison mode (default: auto-detect from GITHUB_BASE_REF)"
+    )
+
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--product", default="red_hat_developer_hub",
-        help="Product slug (default: red_hat_developer_hub)"
-    )
-    common.add_argument(
-        "--version", required=True,
-        help="Product version (e.g., 1.9, 1.10)"
-    )
     common.add_argument(
         "--title", action="append",
         help="Filter titles by substring (repeatable; default: all)"
@@ -460,12 +849,34 @@ Examples:
         help="Run browser in headless mode (faster)"
     )
 
+    # Pantheon-specific options
+    pantheon = argparse.ArgumentParser(add_help=False)
+    pantheon.add_argument(
+        "--pantheon-product", default=os.getenv("PANTHEON_PRODUCT", "red_hat_developer_hub"),
+        help="Product slug (default: $PANTHEON_PRODUCT or red_hat_developer_hub)"
+    )
+    pantheon.add_argument(
+        "--pantheon-version", default=os.getenv("PANTHEON_VERSION"),
+        help="Product version (e.g., 1.9, 1.10) (default: $PANTHEON_VERSION)"
+    )
+
+    # PR mode options
+    pr_mode = argparse.ArgumentParser(add_help=False)
+    pr_mode.add_argument(
+        "--env-a", default=os.getenv("ENV_A"),
+        help="Environment A base URL (default: $ENV_A)"
+    )
+    pr_mode.add_argument(
+        "--env-b", default=os.getenv("ENV_B"),
+        help="Environment B base URL (default: $ENV_B)"
+    )
+
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # urls
     p_urls = subparsers.add_parser(
-        "urls", parents=[common],
-        help="List stage/preview URLs for titles"
+        "urls", parents=[common, pantheon],
+        help="List stage/preview URLs for titles (Pantheon mode only)"
     )
     p_urls.add_argument(
         "--json", action="store_true",
@@ -474,15 +885,45 @@ Examples:
 
     # diff
     p_diff = subparsers.add_parser(
-        "diff", parents=[common],
-        help="Visual diff between stage and preview builds"
+        "diff", parents=[common, pantheon, pr_mode],
+        help="Visual diff between two environments"
     )
     p_diff.add_argument(
         "--output", "-o", default="/tmp/pantheon-diff",
         help="Output directory (default: /tmp/pantheon-diff)"
     )
+    p_diff.add_argument(
+        "--output-json", action="store_true",
+        help="Write results.json with comparison summary"
+    )
+    p_diff.add_argument(
+        "--output-markdown", action="store_true",
+        help="Write summary.md with markdown report"
+    )
 
     args = parser.parse_args()
+
+    # Auto-detect mode
+    if not args.mode:
+        if os.getenv("GITHUB_BASE_REF"):
+            args.mode = "pr"
+        else:
+            args.mode = "pantheon"
+
+    # Validate pantheon mode requirements
+    if args.mode == "pantheon":
+        if not args.pantheon_version:
+            parser.error("Pantheon mode requires --pantheon-version or $PANTHEON_VERSION")
+        if not os.getenv("SSO_EMAIL"):
+            parser.error("Pantheon mode requires $SSO_EMAIL environment variable")
+        # Map pantheon args to legacy args for backward compat
+        args.product = args.pantheon_product
+        args.version = args.pantheon_version
+    elif args.mode == "pr":
+        if args.command == "urls":
+            parser.error("urls command is only available in Pantheon mode")
+        if not args.env_a or not args.env_b:
+            parser.error("PR mode requires --env-a and --env-b (or $ENV_A and $ENV_B)")
 
     handlers = {
         'urls': cmd_urls,
