@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""Visual diff between stage and preview builds.
+
+Scrapes title links from the splash pages, screenshots each title in both
+environments, and generates an HTML report with side-by-side comparisons.
+
+Requires VPN access and a valid Kerberos ticket (for SPNEGO auth).
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Re-exec under the repo venv, creating it if needed
+_script = Path(__file__).resolve()
+_repo_root = _script.parent.parent
+_venv_python = _repo_root / 'venv' / 'bin' / 'python'
+_requirements = _repo_root / 'requirements.txt'
+
+if not _venv_python.is_file():
+    import subprocess
+    print("Creating venv and installing dependencies...")
+    subprocess.check_call([sys.executable, '-m', 'venv', str(_repo_root / 'venv')])
+    subprocess.check_call([str(_venv_python), '-m', 'pip', 'install', '-q', '-r', str(_requirements)])
+    subprocess.check_call([str(_repo_root / 'venv' / 'bin' / 'playwright'), 'install', 'firefox'])
+
+if Path(sys.executable).resolve() != _venv_python.resolve():
+    os.execv(str(_venv_python), [str(_venv_python), str(_script)] + sys.argv[1:])
+
+# Load .env if present
+_env_file = _repo_root / '.env'
+if _env_file.is_file():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+import time
+import json
+import shutil
+import argparse
+
+from playwright.sync_api import sync_playwright
+
+SESSION_DIR = "/tmp/pantheon-session"
+
+CONTENT_BASE = {
+    'preview': 'https://content-preview.docs.redhat.com',
+    'stage': 'https://content-stage.docs.redhat.com',
+}
+
+
+# ---------------------------------------------------------------------------
+# Splash page helpers
+# ---------------------------------------------------------------------------
+
+def splash_url(env, product, version):
+    """Build the splash page URL for a product/version."""
+    return f"{CONTENT_BASE[env]}/en/documentation/{product}/{version}/"
+
+
+def _dismiss_overlays(page):
+    """Remove TrustArc cookie consent overlays that block interaction."""
+    try:
+        page.evaluate("""() => {
+            document.querySelectorAll('[class*="truste"], #truste-consent-track, .trustarc-banner-container, #consent_blackbar').forEach(e => e.remove());
+            const iframe = document.querySelector('iframe[src*="consent"]');
+            if (iframe) iframe.remove();
+        }""")
+    except Exception:
+        pass
+
+
+def scrape_title_links(page, url, product, version):
+    """Scrape title links from a splash page. Returns list of (name, href).
+
+    Uses the /html/ (multi-page) links from the splash page, which produce
+    shorter pages better suited for full-page screenshots.
+    """
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    time.sleep(3)
+    _dismiss_overlays(page)
+    # Match links like /documentation/.../red_hat_developer_hub/1.9/html/title_slug
+    pattern = f"/{product}/{version}/html/"
+    links = page.evaluate("""(pattern) => {
+        const results = [];
+        for (const a of document.querySelectorAll('a')) {
+            if (a.href.includes(pattern)) {
+                const name = a.textContent.trim();
+                if (name) results.push({name, href: a.href});
+            }
+        }
+        return results;
+    }""", pattern)
+    return [(l['name'], l['href']) for l in links]
+
+
+def open_browser(fresh=False, headless=False):
+    """Launch Firefox with Kerberos SPNEGO for content sites."""
+    if fresh and os.path.exists(SESSION_DIR):
+        shutil.rmtree(SESSION_DIR)
+
+    p = sync_playwright().start()
+    browser = p.firefox.launch_persistent_context(
+        SESSION_DIR,
+        headless=headless,
+        viewport={"width": 1400, "height": 900},
+        ignore_https_errors=True,
+        firefox_user_prefs={
+            "network.negotiate-auth.trusted-uris": ".redhat.com,.cee.redhat.com",
+        },
+    )
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    return p, browser, page
+
+
+def _full_page_screenshot(page, path):
+    """Take a full-page screenshot.
+
+    Red Hat docs pages use a fixed-height layout with a scrollable inner
+    container (#app-content). We expand all scrollable containers to their
+    full scroll height, resize the viewport to match, take the screenshot,
+    then restore everything.
+    """
+    # Scroll the main content container to trigger lazy loading
+    page.evaluate("""() => {
+        const container = document.querySelector('#app-content') || document.body;
+        return new Promise((resolve) => {
+            let totalHeight = 0;
+            const distance = 1000;
+            const timer = setInterval(() => {
+                container.scrollBy(0, distance);
+                totalHeight += distance;
+                if (totalHeight >= container.scrollHeight) {
+                    clearInterval(timer);
+                    container.scrollTo(0, 0);
+                    resolve();
+                }
+            }, 100);
+        });
+    }""")
+    time.sleep(1)
+
+    # Expand scrollable containers and get full height
+    full_height = page.evaluate("""() => {
+        // Find the tallest scrollable container
+        let maxH = document.documentElement.scrollHeight;
+        for (const el of document.querySelectorAll('*')) {
+            if (el.scrollHeight > el.clientHeight + 50) {
+                el.style.overflow = 'visible';
+                el.style.maxHeight = 'none';
+                el.style.height = 'auto';
+                maxH = Math.max(maxH, el.scrollHeight);
+            }
+        }
+        // Also expand html/body
+        document.documentElement.style.overflow = 'visible';
+        document.documentElement.style.height = 'auto';
+        document.body.style.overflow = 'visible';
+        document.body.style.height = 'auto';
+        return Math.max(maxH, document.documentElement.scrollHeight, document.body.scrollHeight);
+    }""")
+
+    # Resize viewport to full content height
+    page.set_viewport_size({"width": 1400, "height": full_height})
+    time.sleep(0.5)
+    page.screenshot(path=str(path))
+    page.set_viewport_size({"width": 1400, "height": 900})
+
+
+def slugify(name):
+    """Convert a title name to a filesystem-safe slug."""
+    slug = name.lower().replace(' ', '_')
+    return ''.join(c if c.isalnum() or c in '_-' else '_' for c in slug)
+
+
+# ---------------------------------------------------------------------------
+# Screenshot comparison
+# ---------------------------------------------------------------------------
+
+def compare_screenshots(stage_path, preview_path, diff_path):
+    """Compare two screenshots pixel-by-pixel.
+
+    Returns 'identical' or 'changed'. If changed, writes a diff overlay
+    to diff_path with changed pixels highlighted in red.
+    """
+    from PIL import Image, ImageChops
+
+    img_stage = Image.open(stage_path).convert('RGB')
+    img_preview = Image.open(preview_path).convert('RGB')
+
+    # Pad to same dimensions
+    max_w = max(img_stage.width, img_preview.width)
+    max_h = max(img_stage.height, img_preview.height)
+    if img_stage.size != (max_w, max_h):
+        canvas = Image.new('RGB', (max_w, max_h), (255, 255, 255))
+        canvas.paste(img_stage, (0, 0))
+        img_stage = canvas
+    if img_preview.size != (max_w, max_h):
+        canvas = Image.new('RGB', (max_w, max_h), (255, 255, 255))
+        canvas.paste(img_preview, (0, 0))
+        img_preview = canvas
+
+    diff_img = ImageChops.difference(img_stage, img_preview)
+    if diff_img.getbbox() is None:
+        return 'identical'
+
+    # Create diff overlay
+    overlay = img_preview.copy()
+    diff_px = diff_img.load()
+    over_px = overlay.load()
+    for y in range(max_h):
+        for x in range(max_w):
+            r, g, b = diff_px[x, y]
+            if r + g + b > 30:
+                over_px[x, y] = (255, 0, 0)
+    overlay.save(str(diff_path))
+    return 'changed'
+
+
+# ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+
+def generate_report(output_dir, summary, product, version):
+    """Generate an HTML report for the visual diff."""
+    rows = []
+    for s in summary:
+        slug = s['slug']
+        status = s['status']
+        if status == 'identical':
+            badge = '<span style="color:green">identical</span>'
+            detail = ''
+        elif status == 'changed':
+            badge = '<span style="color:red;font-weight:bold">CHANGED</span>'
+            detail = f'<a href="#{slug}">view diff</a>'
+        elif status == 'error':
+            badge = '<span style="color:orange">error</span>'
+            detail = s.get('detail', '')
+        else:
+            badge = '<span style="color:gray">skipped</span>'
+            detail = s.get('detail', '')
+        rows.append(f'<tr><td>{s["name"]}</td><td>{badge}</td><td>{detail}</td></tr>')
+
+    details = []
+    for s in summary:
+        if s['status'] != 'changed':
+            continue
+        slug = s['slug']
+        details.append(f'''
+        <h2 id="{slug}">{s["name"]}</h2>
+        <p>
+          <a href="{s.get('stage_url', '')}" target="_blank">Stage</a> |
+          <a href="{s.get('preview_url', '')}" target="_blank">Preview</a>
+        </p>
+        <div style="display:flex;gap:20px;flex-wrap:wrap">
+          <div><h3>Stage</h3><img src="{slug}_stage.png" style="max-width:45vw;border:1px solid #ccc"></div>
+          <div><h3>Preview</h3><img src="{slug}_preview.png" style="max-width:45vw;border:1px solid #ccc"></div>
+        </div>
+        <div><h3>Diff overlay</h3><img src="{slug}_diff.png" style="max-width:90vw;border:1px solid #ccc"></div>
+        <hr>
+        ''')
+
+    html = f'''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Visual Diff: {product} {version}</title>
+<style>
+  body {{ font-family: sans-serif; margin: 20px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+  th {{ background: #f5f5f5; }}
+  img {{ max-height: 600px; }}
+</style></head><body>
+<h1>Visual Diff: {product} {version} (stage vs preview)</h1>
+<table>
+<tr><th>Title</th><th>Status</th><th>Details</th></tr>
+{"".join(rows)}
+</table>
+<hr>
+{"".join(details)}
+</body></html>'''
+
+    (output_dir / 'index.html').write_text(html)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_urls(args):
+    """List stage/preview URLs from the splash pages."""
+    p, browser, page = open_browser(args.fresh, args.headless)
+
+    try:
+        preview = splash_url('preview', args.product, args.version)
+        stage = splash_url('stage', args.product, args.version)
+
+        print(f"Preview splash: {preview}")
+        print(f"Stage splash:   {stage}\n")
+
+        preview_links = scrape_title_links(page, preview, args.product, args.version)
+        stage_links = scrape_title_links(page, stage, args.product, args.version)
+
+        stage_by_name = dict(stage_links)
+        preview_by_name = dict(preview_links)
+        all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+
+        if args.title:
+            all_names = [n for n in all_names
+                         if any(t.lower() in n.lower() for t in args.title)]
+
+        results = [{'name': n, 'preview': preview_by_name.get(n, ''),
+                     'stage': stage_by_name.get(n, '')} for n in all_names]
+
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            for r in results:
+                print(f"{r['name']}")
+                print(f"  preview: {r['preview'] or 'N/A'}")
+                print(f"  stage:   {r['stage'] or 'N/A'}")
+                print()
+            print(f"Total: {len(results)} titles")
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_diff(args):
+    """Generate visual diff between stage and preview builds."""
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        sys.exit("Error: Pillow is required. Install: pip install Pillow>=10.0")
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    p, browser, page = open_browser(args.fresh, args.headless)
+
+    try:
+        preview = splash_url('preview', args.product, args.version)
+        stage = splash_url('stage', args.product, args.version)
+
+        print(f"Scraping preview: {preview}")
+        preview_links = scrape_title_links(page, preview, args.product, args.version)
+        print(f"Scraping stage:   {stage}")
+        stage_links = scrape_title_links(page, stage, args.product, args.version)
+
+        stage_by_name = dict(stage_links)
+        preview_by_name = dict(preview_links)
+        all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+
+        if args.title:
+            all_names = [n for n in all_names
+                         if any(t.lower() in n.lower() for t in args.title)]
+
+        print(f"\nComparing {len(all_names)} titles (stage vs preview)\n")
+
+        summary = []
+        for i, name in enumerate(all_names):
+            s_url = stage_by_name.get(name, '')
+            p_url = preview_by_name.get(name, '')
+            slug = slugify(name)
+
+            print(f"[{i+1}/{len(all_names)}] {name}")
+
+            if not s_url or not p_url:
+                missing = 'stage' if not s_url else 'preview'
+                print(f"  SKIP: no {missing} URL")
+                summary.append({'name': name, 'slug': slug, 'status': 'skipped',
+                                'detail': f'No {missing} URL'})
+                continue
+
+            try:
+                # Screenshot stage
+                page.goto(s_url, wait_until="networkidle", timeout=120000)
+                time.sleep(3)
+                _dismiss_overlays(page)
+                stage_path = output_dir / f"{slug}_stage.png"
+                _full_page_screenshot(page, stage_path)
+
+                # Screenshot preview
+                page.goto(p_url, wait_until="networkidle", timeout=120000)
+                time.sleep(3)
+                _dismiss_overlays(page)
+                preview_path = output_dir / f"{slug}_preview.png"
+                _full_page_screenshot(page, preview_path)
+
+                # Compare
+                diff_path = output_dir / f"{slug}_diff.png"
+                status = compare_screenshots(stage_path, preview_path, diff_path)
+                print(f"  {status.upper() if status == 'changed' else status}")
+
+                summary.append({
+                    'name': name, 'slug': slug, 'status': status,
+                    'stage_url': s_url, 'preview_url': p_url,
+                })
+
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                summary.append({'name': name, 'slug': slug, 'status': 'error',
+                                'detail': str(e)})
+
+            time.sleep(1)
+
+        generate_report(output_dir, summary, args.product, args.version)
+        changed = sum(1 for s in summary if s['status'] == 'changed')
+        identical = sum(1 for s in summary if s['status'] == 'identical')
+        errors = sum(1 for s in summary if s['status'] in ('error', 'skipped'))
+        print(f"\nDone. Changed: {changed}, Identical: {identical}, Errors: {errors}")
+        print(f"Report: {output_dir / 'index.html'}")
+
+    finally:
+        browser.close()
+        p.stop()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Visual diff between stage and preview docs builds",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Prerequisites:
+  - Valid Kerberos ticket (run 'kinit' first)
+  - VPN connection to Red Hat network
+  - Playwright Firefox (installed via setup.sh)
+
+Examples:
+  visual-diff urls --version 1.9
+  visual-diff diff --version 1.9 --output /tmp/rhdh-1.9-diff/
+  visual-diff diff --version 1.9 --title "About" --output /tmp/rhdh-diff/
+""",
+    )
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--product", default="red_hat_developer_hub",
+        help="Product slug (default: red_hat_developer_hub)"
+    )
+    common.add_argument(
+        "--version", required=True,
+        help="Product version (e.g., 1.9, 1.10)"
+    )
+    common.add_argument(
+        "--title", action="append",
+        help="Filter titles by substring (repeatable; default: all)"
+    )
+    common.add_argument(
+        "--fresh", action="store_true",
+        help="Clear browser session"
+    )
+    common.add_argument(
+        "--headless", action="store_true",
+        help="Run browser in headless mode (faster)"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # urls
+    p_urls = subparsers.add_parser(
+        "urls", parents=[common],
+        help="List stage/preview URLs for titles"
+    )
+    p_urls.add_argument(
+        "--json", action="store_true",
+        help="Output as JSON"
+    )
+
+    # diff
+    p_diff = subparsers.add_parser(
+        "diff", parents=[common],
+        help="Visual diff between stage and preview builds"
+    )
+    p_diff.add_argument(
+        "--output", "-o", default="/tmp/pantheon-diff",
+        help="Output directory (default: /tmp/pantheon-diff)"
+    )
+
+    args = parser.parse_args()
+
+    handlers = {
+        'urls': cmd_urls,
+        'diff': cmd_diff,
+    }
+    handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
