@@ -1,0 +1,61 @@
+name: 'Visual Diff'
+description: 'Compare documentation builds visually and post results as PR comment'
+inputs:
+  build-path:
+    description: 'Path to the ccutil build output directory'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token for posting PR comments'
+    required: true
+  output-dir:
+    description: 'Output directory for diff results'
+    required: false
+    default: '/tmp/visual-diff-output'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install visual-diff
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        pip install -r ../requirements.txt
+        playwright install firefox
+      env:
+        PLAYWRIGHT_BROWSERS_PATH: /tmp/pw-browsers
+
+    - name: Run visual diff
+      shell: bash
+      run: |
+        python ${{ github.action_path }}/../scripts/visual-diff diff \
+          --mode pr \
+          --output ${{ inputs.output-dir }} \
+          --output-markdown \
+          --output-json \
+          --headless
+      env:
+        GITHUB_BASE_REF: ${{ github.base_ref }}
+        GITHUB_EVENT_NUMBER: ${{ github.event.number }}
+        PLAYWRIGHT_BROWSERS_PATH: /tmp/pw-browsers
+
+    - name: Post PR comment
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      shell: bash
+      run: |
+        SUMMARY="${{ inputs.output-dir }}/summary.md"
+        if [ ! -f "$SUMMARY" ]; then
+          echo "No summary.md found. Skipping comment."
+          exit 0
+        fi
+        # Post comment using gh CLI
+        gh pr comment ${{ github.event.number }} \
+          --repo ${{ github.repository }} \
+          --body-file "$SUMMARY"
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
