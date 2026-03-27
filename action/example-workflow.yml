@@ -1,0 +1,37 @@
+# Example workflow for red-hat-developers-documentation-rhdh
+# Add this to .github/workflows/visual-diff.yml in the docs repo
+name: Visual Diff
+on:
+  pull_request_target:
+    branches: [main, 'rhdh-1.**', '1.**.x', 'release-1.**']
+
+concurrency:
+  group: visual-diff-${{ github.event.number }}
+  cancel-in-progress: true
+
+jobs:
+  visual-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Checkout PR content
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Checkout base build script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: trusted-scripts
+          sparse-checkout: build/scripts
+
+      - name: Build PR docs
+        run: trusted-scripts/build/scripts/build-ccutil.sh -b "pr-${{ github.event.number }}"
+
+      - name: Run visual diff
+        uses: themr0c/visual-diff@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
