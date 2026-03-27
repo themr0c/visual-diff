@@ -222,16 +222,6 @@ def open_browser(fresh=False, headless=False):
     return p, browser, page
 
 
-def _get_text_hash(page):
-    """Get a hash of the visible text content for quick identity check."""
-    import hashlib
-    text = page.evaluate("""() => {
-        const el = document.querySelector('#app-content') || document.body;
-        return el.innerText;
-    }""")
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-
 def _full_page_screenshot(page, path):
     """Take a full-page screenshot.
 
@@ -811,13 +801,9 @@ def cmd_diff(args):
             label_a = "Env A"
             label_b = "Env B"
 
-        # Screenshot and compare each item using two tabs
+        # Screenshot and compare each item
         print(f"\nComparing {len(comparisons)} pages\n")
         summary = []
-        # Open second tab via JavaScript (persistent context doesn't support new_page())
-        page.evaluate("window.open('about:blank')")
-        page_b = browser.pages[-1]
-        page_b.set_viewport_size({"width": 1400, "height": 900})
 
         for i, item in enumerate(comparisons):
             title = item['title']
@@ -850,30 +836,34 @@ def cmd_diff(args):
                 continue
 
             try:
-                # Navigate both tabs in parallel
-                page.goto(a_url, wait_until="networkidle", timeout=120000)
-                page_b.goto(b_url, wait_until="networkidle", timeout=120000)
-                time.sleep(1)
-                _dismiss_overlays(page)
-                _dismiss_overlays(page_b)
-
-                # Quick text hash comparison to skip identical pages
-                hash_a = _get_text_hash(page)
-                hash_b = _get_text_hash(page_b)
-                if hash_a == hash_b:
-                    print("  identical (text match)")
-                    item['slug'] = slug
-                    item['status'] = 'identical'
-                    item['change_pct'] = 0.0
-                    summary.append(item)
-                    continue
+                # Quick text comparison via HTTP to skip identical pages
+                try:
+                    soup_a = _fetch_html(a_url)
+                    soup_b = _fetch_html(b_url)
+                    text_a = soup_a.get_text(strip=True)
+                    text_b = soup_b.get_text(strip=True)
+                    if text_a == text_b:
+                        print("  identical (text match)")
+                        item['slug'] = slug
+                        item['status'] = 'identical'
+                        item['change_pct'] = 0.0
+                        summary.append(item)
+                        continue
+                except Exception:
+                    pass  # Fall through to visual comparison
 
                 # Text differs — take full screenshots
+                page.goto(a_url, wait_until="networkidle", timeout=120000)
+                time.sleep(1)
+                _dismiss_overlays(page)
                 a_path = output_dir / f"{slug}_a.png"
                 _full_page_screenshot(page, a_path)
 
+                page.goto(b_url, wait_until="networkidle", timeout=120000)
+                time.sleep(1)
+                _dismiss_overlays(page)
                 b_path = output_dir / f"{slug}_b.png"
-                _full_page_screenshot(page_b, b_path)
+                _full_page_screenshot(page, b_path)
 
                 # Compare
                 status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
@@ -892,8 +882,6 @@ def cmd_diff(args):
                 item['status'] = 'error'
                 item['detail'] = str(e)
                 summary.append(item)
-
-        page_b.close()
 
         generate_report(output_dir, summary, label_a, label_b)
         changed = sum(1 for s in summary if s.get('status') == 'changed')
