@@ -3,11 +3,10 @@
 
 Scrapes title links from the splash pages, screenshots each title in both
 environments, and generates an HTML report with side-by-side comparisons.
-
-Requires VPN access and a valid Kerberos ticket (for SPNEGO auth).
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -40,7 +39,13 @@ import time
 import json
 import shutil
 import argparse
+from urllib.parse import urljoin
 
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from playwright.sync_api import sync_playwright
 
 SESSION_DIR = str(Path(__file__).resolve().parent.parent / '.cache' / 'pantheon-session')
@@ -99,50 +104,46 @@ def _dismiss_overlays(page):
         pass
 
 
-def scrape_title_links(page, url, product, version):
+def _fetch_html(url):
+    """Fetch HTML content from a URL using requests."""
+    resp = requests.get(url, timeout=30, verify=False)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, 'html.parser')
+
+
+def scrape_title_links(url, product, version):
     """Scrape title links from a splash page. Returns list of (name, href).
 
     Uses the /html/ (multi-page) links from the splash page, which produce
     shorter pages better suited for full-page screenshots.
     """
-    page.goto(url, wait_until="networkidle", timeout=60000)
-    time.sleep(3)
-    _dismiss_overlays(page)
-    # Match links like /documentation/.../red_hat_developer_hub/1.9/html/title_slug
+    soup = _fetch_html(url)
     pattern = f"/{product}/{version}/html/"
-    links = page.evaluate("""(pattern) => {
-        const results = [];
-        for (const a of document.querySelectorAll('a')) {
-            if (a.href.includes(pattern)) {
-                const name = a.textContent.trim();
-                if (name) results.push({name, href: a.href});
-            }
-        }
-        return results;
-    }""", pattern)
-    return [(l['name'], l['href']) for l in links]
+    results = []
+    for a in soup.find_all('a', href=True):
+        if pattern in a['href']:
+            name = a.get_text(strip=True)
+            if name:
+                href = urljoin(url, a['href'])
+                results.append((name, href))
+    return results
 
 
-def scrape_title_links_from_build(page, base_url):
+def scrape_title_links_from_build(base_url):
     """Scrape title links from a ccutil build index page.
 
     ccutil builds have an index.html listing all titles.
     Returns list of (name, href).
     """
     url = base_url.rstrip('/') + '/index.html' if not base_url.endswith('.html') else base_url
-    page.goto(url, wait_until="networkidle", timeout=60000)
-    time.sleep(2)
-    links = page.evaluate("""() => {
-        const results = [];
-        for (const a of document.querySelectorAll('a')) {
-            const name = a.textContent.trim();
-            if (name && a.href && !a.href.endsWith('index.html')) {
-                results.push({name, href: a.href});
-            }
-        }
-        return results;
-    }""")
-    return [(l['name'], l['href']) for l in links]
+    soup = _fetch_html(url)
+    results = []
+    for a in soup.find_all('a', href=True):
+        name = a.get_text(strip=True)
+        href = urljoin(url, a['href'])
+        if name and not href.endswith('index.html'):
+            results.append((name, href))
+    return results
 
 
 def extract_title_slug(url, product, version):
@@ -160,70 +161,53 @@ def extract_title_slug(url, product, version):
     return None
 
 
-def scrape_chapter_links(page, title_url, product, version, title_slug):
+_JUNK_CHAPTER_RE = re.compile(
+    r'^(skip.to|legal.notice|deutsch|english|español|français|italiano|português'
+    r'|日本語|한국어|中文.*|preface|next|previous|prev|back to top|table of contents)$',
+    re.IGNORECASE,
+)
+
+def scrape_chapter_links(title_url, product, version, title_slug):
     """Scrape chapter links from a title's left-nav/TOC sidebar.
 
     Returns list of (chapter_name, href) for real chapters only.
     Filters out language selectors, skip-to links, legal notices, and
     other non-chapter navigation elements.
     """
-    page.goto(title_url, wait_until="networkidle", timeout=60000)
-    time.sleep(2)
-    _dismiss_overlays(page)
-
-    # Match links like /{product}/{version}/html/{title_slug}/{chapter}
+    soup = _fetch_html(title_url)
     pattern = f"/{product}/{version}/html/{title_slug}/"
-    links = page.evaluate("""(pattern) => {
-        const results = [];
-        const seen = new Set();
 
-        // Target TOC/nav sidebar links only
-        const navSelectors = [
-            '.pf-c-nav__list a',
-            '.pf-v5-c-nav__list a',
-            'nav a',
-            '[role="navigation"] a',
-            '.toc a',
-            '#toc a',
-        ];
+    # Target TOC/nav sidebar links first
+    nav_selectors = [
+        'nav a', '[role="navigation"] a',
+        '.pf-c-nav__list a', '.pf-v5-c-nav__list a',
+        '.toc a', '#toc a',
+    ]
+    anchors = None
+    for sel in nav_selectors:
+        found = soup.select(sel)
+        if found:
+            anchors = found
+            break
+    if not anchors:
+        anchors = soup.find_all('a', href=True)
 
-        let anchors = [];
-        for (const sel of navSelectors) {
-            const found = document.querySelectorAll(sel);
-            if (found.length > 0) {
-                anchors = found;
-                break;
-            }
-        }
-        // Fallback to all links if no nav container found
-        if (anchors.length === 0) {
-            anchors = document.querySelectorAll('a');
-        }
-
-        // Junk patterns to exclude
-        const junkPatterns = [
-            /skip.to/i, /legal.notice/i, /^(deutsch|english|español|français|italiano|português)$/i,
-            /^日本語$/, /^한국어$/, /^中文/, /^preface$/i,
-            /^(next|previous|prev)$/i, /^(back to top|table of contents)$/i,
-        ];
-
-        for (const a of anchors) {
-            if (a.href.includes(pattern)) {
-                const name = a.textContent.trim();
-                const href = a.href.split('#')[0];  // Normalize anchors
-                if (name && !seen.has(href) && !junkPatterns.some(p => p.test(name))) {
-                    results.push({name, href});
-                    seen.add(href);
-                }
-            }
-        }
-        return results;
-    }""", pattern)
-    return [(l['name'], l['href']) for l in links]
+    results = []
+    seen = set()
+    for a in anchors:
+        href = a.get('href', '')
+        if pattern not in href:
+            continue
+        name = a.get_text(strip=True)
+        href = urljoin(title_url, href.split('#')[0])
+        if name and href not in seen and not _JUNK_CHAPTER_RE.match(name):
+            results.append((name, href))
+            seen.add(href)
+    return results
 
 
 def open_browser(fresh=False, headless=False):
-    """Launch Firefox with Kerberos SPNEGO for content sites."""
+    """Launch Firefox for screenshots."""
     if fresh and os.path.exists(SESSION_DIR):
         shutil.rmtree(SESSION_DIR)
 
@@ -233,9 +217,6 @@ def open_browser(fresh=False, headless=False):
         headless=headless,
         viewport={"width": 1400, "height": 900},
         ignore_https_errors=True,
-        firefox_user_prefs={
-            "network.negotiate-auth.trusted-uris": ".redhat.com,.cee.redhat.com",
-        },
     )
     page = browser.pages[0] if browser.pages else browser.new_page()
     return p, browser, page
@@ -642,74 +623,66 @@ def generate_report(output_dir, summary, label_a="Environment A", label_b="Envir
 
 def cmd_urls(args):
     """List stage/preview URLs from the splash pages."""
-    p, browser, page = open_browser(args.fresh, args.headless)
+    if args.mode == "pr":
+        env_a, env_b = resolve_pr_envs(args)
 
-    try:
-        if args.mode == "pr":
-            # PR mode: scrape from build index pages
-            env_a, env_b = resolve_pr_envs(args)
+        print(f"Env A: {env_a}")
+        print(f"Env B: {env_b}\n")
 
-            print(f"Env A: {env_a}")
-            print(f"Env B: {env_b}\n")
+        a_links = scrape_title_links_from_build(env_a)
+        b_links = scrape_title_links_from_build(env_b)
 
-            a_links = scrape_title_links_from_build(page, env_a)
-            b_links = scrape_title_links_from_build(page, env_b)
+        a_by_name = dict(a_links)
+        b_by_name = dict(b_links)
+        all_names = sorted(set(list(a_by_name) + list(b_by_name)))
 
-            a_by_name = dict(a_links)
-            b_by_name = dict(b_links)
-            all_names = sorted(set(list(a_by_name) + list(b_by_name)))
+        if args.title:
+            all_names = [n for n in all_names
+                         if any(t.lower() in n.lower() for t in args.title)]
 
-            if args.title:
-                all_names = [n for n in all_names
-                             if any(t.lower() in n.lower() for t in args.title)]
+        results = [{'name': n, 'env_a': a_by_name.get(n, ''),
+                     'env_b': b_by_name.get(n, '')} for n in all_names]
 
-            results = [{'name': n, 'env_a': a_by_name.get(n, ''),
-                         'env_b': b_by_name.get(n, '')} for n in all_names]
-
-            if args.json:
-                print(json.dumps(results, indent=2))
-            else:
-                for r in results:
-                    print(f"{r['name']}")
-                    print(f"  env-a: {r['env_a'] or 'N/A'}")
-                    print(f"  env-b: {r['env_b'] or 'N/A'}")
-                    print()
-                print(f"Total: {len(results)} titles")
-
+        if args.json:
+            print(json.dumps(results, indent=2))
         else:
-            # Pantheon mode: scrape from splash pages
-            preview = splash_url('preview', args.product, args.version)
-            stage = splash_url('stage', args.product, args.version)
+            for r in results:
+                print(f"{r['name']}")
+                print(f"  env-a: {r['env_a'] or 'N/A'}")
+                print(f"  env-b: {r['env_b'] or 'N/A'}")
+                print()
+            print(f"Total: {len(results)} titles")
 
-            print(f"Preview splash: {preview}")
-            print(f"Stage splash:   {stage}\n")
+    else:
+        preview = splash_url('preview', args.product, args.version)
+        stage = splash_url('stage', args.product, args.version)
 
-            preview_links = scrape_title_links(page, preview, args.product, args.version)
-            stage_links = scrape_title_links(page, stage, args.product, args.version)
+        print(f"Preview splash: {preview}")
+        print(f"Stage splash:   {stage}\n")
 
-            stage_by_name = dict(stage_links)
-            preview_by_name = dict(preview_links)
-            all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+        preview_links = scrape_title_links(preview, args.product, args.version)
+        stage_links = scrape_title_links(stage, args.product, args.version)
 
-            if args.title:
-                all_names = [n for n in all_names
-                             if any(t.lower() in n.lower() for t in args.title)]
+        stage_by_name = dict(stage_links)
+        preview_by_name = dict(preview_links)
+        all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
 
-            results = [{'name': n, 'preview': preview_by_name.get(n, ''),
-                         'stage': stage_by_name.get(n, '')} for n in all_names]
+        if args.title:
+            all_names = [n for n in all_names
+                         if any(t.lower() in n.lower() for t in args.title)]
 
-            if args.json:
-                print(json.dumps(results, indent=2))
-            else:
-                for r in results:
-                    print(f"{r['name']}")
-                    print(f"  preview: {r['preview'] or 'N/A'}")
-                    print(f"  stage:   {r['stage'] or 'N/A'}")
-                    print()
-                print(f"Total: {len(results)} titles")
-    finally:
-        browser.close()
-        p.stop()
+        results = [{'name': n, 'preview': preview_by_name.get(n, ''),
+                     'stage': stage_by_name.get(n, '')} for n in all_names]
+
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            for r in results:
+                print(f"{r['name']}")
+                print(f"  preview: {r['preview'] or 'N/A'}")
+                print(f"  stage:   {r['stage'] or 'N/A'}")
+                print()
+            print(f"Total: {len(results)} titles")
 
 
 def cmd_diff(args):
@@ -731,9 +704,9 @@ def cmd_diff(args):
             stage = splash_url('stage', args.product, args.version)
 
             print(f"Scraping preview: {preview}")
-            preview_links = scrape_title_links(page, preview, args.product, args.version)
+            preview_links = scrape_title_links(preview, args.product, args.version)
             print(f"Scraping stage:   {stage}")
-            stage_links = scrape_title_links(page, stage, args.product, args.version)
+            stage_links = scrape_title_links(stage, args.product, args.version)
 
             stage_by_name = dict(stage_links)
             preview_by_name = dict(preview_links)
@@ -776,9 +749,9 @@ def cmd_diff(args):
 
                 try:
                     # Scrape chapters from stage
-                    stage_chapters = scrape_chapter_links(page, stage_title_url,
+                    stage_chapters = scrape_chapter_links(stage_title_url,
                                                          args.product, args.version, title_slug)
-                    preview_chapters = scrape_chapter_links(page, preview_title_url,
+                    preview_chapters = scrape_chapter_links(preview_title_url,
                                                            args.product, args.version, title_slug)
 
                     stage_ch_by_name = dict(stage_chapters)
@@ -811,9 +784,9 @@ def cmd_diff(args):
             env_a, env_b = resolve_pr_envs(args)
 
             print(f"Scraping env-a: {env_a}")
-            a_links = scrape_title_links_from_build(page, env_a)
+            a_links = scrape_title_links_from_build(env_a)
             print(f"Scraping env-b: {env_b}")
-            b_links = scrape_title_links_from_build(page, env_b)
+            b_links = scrape_title_links_from_build(env_b)
 
             a_by_name = dict(a_links)
             b_by_name = dict(b_links)
@@ -973,7 +946,6 @@ Modes:
   pr       - Compare two PR build environments (A vs B)
 
 Prerequisites (Pantheon mode):
-  - Valid Kerberos ticket (run 'kinit' first)
   - VPN connection to Red Hat network
   - Playwright Firefox (installed via setup.sh)
 
@@ -1071,8 +1043,6 @@ Examples (PR mode):
     if args.mode == "pantheon":
         if not args.pantheon_version:
             parser.error("Pantheon mode requires --pantheon-version or $PANTHEON_VERSION")
-        if not os.getenv("SSO_EMAIL"):
-            parser.error("Pantheon mode requires $SSO_EMAIL environment variable")
         # Map pantheon args to legacy args for backward compat
         args.product = args.pantheon_product
         args.version = args.pantheon_version
