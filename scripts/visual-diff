@@ -50,6 +50,33 @@ CONTENT_BASE = {
     'stage': 'https://content-stage.docs.redhat.com',
 }
 
+GITHUB_PAGES_BASE = "https://redhat-developer.github.io/red-hat-developers-documentation-rhdh"
+
+
+def resolve_pr_envs(args):
+    """Resolve --env-a and --env-b for PR mode.
+
+    Auto-detects from GitHub Actions environment variables if not provided.
+    """
+    env_a = args.env_a
+    env_b = args.env_b
+
+    if not env_a:
+        pr_number = os.environ.get('GITHUB_EVENT_NUMBER') or os.environ.get('PR_NUMBER')
+        if pr_number:
+            env_a = f"titles-generated/pr-{pr_number}/"
+        else:
+            sys.exit("Error: --env-a is required in PR mode (or set GITHUB_EVENT_NUMBER)")
+
+    if not env_b:
+        base_ref = os.environ.get('GITHUB_BASE_REF')
+        if base_ref:
+            env_b = f"{GITHUB_PAGES_BASE}/{base_ref}/"
+        else:
+            sys.exit("Error: --env-b is required in PR mode (or set GITHUB_BASE_REF)")
+
+    return env_a, env_b
+
 
 # ---------------------------------------------------------------------------
 # Splash page helpers
@@ -93,6 +120,28 @@ def scrape_title_links(page, url, product, version):
         }
         return results;
     }""", pattern)
+    return [(l['name'], l['href']) for l in links]
+
+
+def scrape_title_links_from_build(page, base_url):
+    """Scrape title links from a ccutil build index page.
+
+    ccutil builds have an index.html listing all titles.
+    Returns list of (name, href).
+    """
+    url = base_url.rstrip('/') + '/index.html' if not base_url.endswith('.html') else base_url
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    time.sleep(2)
+    links = page.evaluate("""() => {
+        const results = [];
+        for (const a of document.querySelectorAll('a')) {
+            const name = a.textContent.trim();
+            if (name && a.href && !a.href.endsWith('index.html')) {
+                results.push({name, href: a.href});
+            }
+        }
+        return results;
+    }""")
     return [(l['name'], l['href']) for l in links]
 
 
@@ -562,35 +611,68 @@ def cmd_urls(args):
     p, browser, page = open_browser(args.fresh, args.headless)
 
     try:
-        preview = splash_url('preview', args.product, args.version)
-        stage = splash_url('stage', args.product, args.version)
+        if args.mode == "pr":
+            # PR mode: scrape from build index pages
+            env_a, env_b = resolve_pr_envs(args)
 
-        print(f"Preview splash: {preview}")
-        print(f"Stage splash:   {stage}\n")
+            print(f"Env A: {env_a}")
+            print(f"Env B: {env_b}\n")
 
-        preview_links = scrape_title_links(page, preview, args.product, args.version)
-        stage_links = scrape_title_links(page, stage, args.product, args.version)
+            a_links = scrape_title_links_from_build(page, env_a)
+            b_links = scrape_title_links_from_build(page, env_b)
 
-        stage_by_name = dict(stage_links)
-        preview_by_name = dict(preview_links)
-        all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+            a_by_name = dict(a_links)
+            b_by_name = dict(b_links)
+            all_names = sorted(set(list(a_by_name) + list(b_by_name)))
 
-        if args.title:
-            all_names = [n for n in all_names
-                         if any(t.lower() in n.lower() for t in args.title)]
+            if args.title:
+                all_names = [n for n in all_names
+                             if any(t.lower() in n.lower() for t in args.title)]
 
-        results = [{'name': n, 'preview': preview_by_name.get(n, ''),
-                     'stage': stage_by_name.get(n, '')} for n in all_names]
+            results = [{'name': n, 'env_a': a_by_name.get(n, ''),
+                         'env_b': b_by_name.get(n, '')} for n in all_names]
 
-        if args.json:
-            print(json.dumps(results, indent=2))
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                for r in results:
+                    print(f"{r['name']}")
+                    print(f"  env-a: {r['env_a'] or 'N/A'}")
+                    print(f"  env-b: {r['env_b'] or 'N/A'}")
+                    print()
+                print(f"Total: {len(results)} titles")
+
         else:
-            for r in results:
-                print(f"{r['name']}")
-                print(f"  preview: {r['preview'] or 'N/A'}")
-                print(f"  stage:   {r['stage'] or 'N/A'}")
-                print()
-            print(f"Total: {len(results)} titles")
+            # Pantheon mode: scrape from splash pages
+            preview = splash_url('preview', args.product, args.version)
+            stage = splash_url('stage', args.product, args.version)
+
+            print(f"Preview splash: {preview}")
+            print(f"Stage splash:   {stage}\n")
+
+            preview_links = scrape_title_links(page, preview, args.product, args.version)
+            stage_links = scrape_title_links(page, stage, args.product, args.version)
+
+            stage_by_name = dict(stage_links)
+            preview_by_name = dict(preview_links)
+            all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+
+            if args.title:
+                all_names = [n for n in all_names
+                             if any(t.lower() in n.lower() for t in args.title)]
+
+            results = [{'name': n, 'preview': preview_by_name.get(n, ''),
+                         'stage': stage_by_name.get(n, '')} for n in all_names]
+
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                for r in results:
+                    print(f"{r['name']}")
+                    print(f"  preview: {r['preview'] or 'N/A'}")
+                    print(f"  stage:   {r['stage'] or 'N/A'}")
+                    print()
+                print(f"Total: {len(results)} titles")
     finally:
         browser.close()
         p.stop()
@@ -692,10 +774,35 @@ def cmd_diff(args):
 
         else:
             # PR mode: simple per-title comparison (no chapter crawling)
-            # For now, this is a placeholder - full PR mode implementation would go here
+            env_a, env_b = resolve_pr_envs(args)
+
+            print(f"Scraping env-a: {env_a}")
+            a_links = scrape_title_links_from_build(page, env_a)
+            print(f"Scraping env-b: {env_b}")
+            b_links = scrape_title_links_from_build(page, env_b)
+
+            a_by_name = dict(a_links)
+            b_by_name = dict(b_links)
+            all_names = sorted(set(list(a_by_name) + list(b_by_name)))
+
+            if args.title:
+                all_names = [n for n in all_names
+                             if any(t.lower() in n.lower() for t in args.title)]
+
+            # Build list of (title_name, a_url, b_url) items
             comparisons = []
-            label_a = "Build A"
-            label_b = "Build B"
+            for title_name in all_names:
+                a_url = a_by_name.get(title_name, '')
+                b_url = b_by_name.get(title_name, '')
+                comparisons.append({
+                    'title': title_name,
+                    'chapter': None,
+                    'a_url': a_url,
+                    'b_url': b_url,
+                })
+
+            label_a = "Env A"
+            label_b = "Env B"
 
         # Screenshot and compare each item
         print(f"\nComparing {len(comparisons)} pages\n")
@@ -875,8 +982,8 @@ Examples (PR mode):
 
     # urls
     p_urls = subparsers.add_parser(
-        "urls", parents=[common, pantheon],
-        help="List stage/preview URLs for titles (Pantheon mode only)"
+        "urls", parents=[common, pantheon, pr_mode],
+        help="List URLs for titles from both environments"
     )
     p_urls.add_argument(
         "--json", action="store_true",
@@ -920,10 +1027,8 @@ Examples (PR mode):
         args.product = args.pantheon_product
         args.version = args.pantheon_version
     elif args.mode == "pr":
-        if args.command == "urls":
-            parser.error("urls command is only available in Pantheon mode")
-        if not args.env_a or not args.env_b:
-            parser.error("PR mode requires --env-a and --env-b (or $ENV_A and $ENV_B)")
+        # PR mode validation is handled by resolve_pr_envs() in the command handlers
+        pass
 
     handlers = {
         'urls': cmd_urls,
