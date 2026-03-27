@@ -21,7 +21,7 @@ if not _venv_python.is_file():
     print("Creating venv and installing dependencies...")
     subprocess.check_call([sys.executable, '-m', 'venv', str(_repo_root / 'venv')])
     subprocess.check_call([str(_venv_python), '-m', 'pip', 'install', '-q', '-r', str(_requirements)])
-    subprocess.check_call([str(_repo_root / 'venv' / 'bin' / 'playwright'), 'install', 'firefox'])
+    subprocess.check_call([str(_repo_root / 'venv' / 'bin' / 'playwright'), 'install', 'chromium'])
 
 if _venv_python.is_file() and not sys.prefix.startswith(str(_repo_root / 'venv')):
     os.execv(str(_venv_python), [str(_venv_python), str(_script)] + sys.argv[1:])
@@ -37,7 +37,7 @@ if _env_file.is_file():
 
 import time
 import json
-import shutil
+import subprocess
 import argparse
 from urllib.parse import urljoin
 
@@ -48,7 +48,7 @@ from bs4 import BeautifulSoup
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from playwright.sync_api import sync_playwright
 
-SESSION_DIR = str(Path(__file__).resolve().parent.parent / '.cache' / 'pantheon-session')
+CACHE_DIR = Path(__file__).resolve().parent.parent / '.cache'
 
 CONTENT_BASE = {
     'preview': 'https://content-preview.docs.redhat.com',
@@ -90,18 +90,6 @@ def resolve_pr_envs(args):
 def splash_url(env, product, version):
     """Build the splash page URL for a product/version."""
     return f"{CONTENT_BASE[env]}/en/documentation/{product}/{version}/"
-
-
-def _dismiss_overlays(page):
-    """Remove TrustArc cookie consent overlays that block interaction."""
-    try:
-        page.evaluate("""() => {
-            document.querySelectorAll('[class*="truste"], #truste-consent-track, .trustarc-banner-container, #consent_blackbar').forEach(e => e.remove());
-            const iframe = document.querySelector('iframe[src*="consent"]');
-            if (iframe) iframe.remove();
-        }""")
-    except Exception:
-        pass
 
 
 def _fetch_html(url):
@@ -206,68 +194,83 @@ def scrape_chapter_links(title_url, product, version, title_slug):
     return results
 
 
-def open_browser(fresh=False, headless=False):
-    """Launch Firefox for screenshots."""
-    if fresh and os.path.exists(SESSION_DIR):
-        shutil.rmtree(SESSION_DIR)
+def wget_mirror(url, mirror_dir):
+    """Mirror a URL tree using wget. Downloads HTML pages only (depth 2)."""
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run([
+        'wget', '-r', '-l', '2', '-N', '-nH',
+        '--force-directories', '--adjust-extension',
+        '--no-check-certificate', '-q',
+        '-P', str(mirror_dir),
+        url,
+    ])
+    if result.returncode not in (0, 8):
+        # wget returns 8 for server errors on some pages, which is normal
+        result.check_returncode()
 
+
+def find_page_pairs(product, version):
+    """Find matching HTML pages between stage and preview mirrors.
+
+    Walks mirrored directory trees and matches pages by relative path.
+    Returns list of dicts with title_slug, chapter_slug, paths.
+    """
+    html_base = Path('en') / 'documentation' / product / version / 'html'
+    stage_html = CACHE_DIR / 'mirror' / 'stage' / html_base
+    preview_html = CACHE_DIR / 'mirror' / 'preview' / html_base
+
+    if not stage_html.exists() or not preview_html.exists():
+        return []
+
+    pairs = []
+    for stage_file in sorted(stage_html.rglob('*')):
+        if not stage_file.is_file():
+            continue
+        rel = stage_file.relative_to(stage_html)
+        preview_file = preview_html / rel
+        if preview_file.exists():
+            parts = rel.parts
+            title_slug = parts[0] if parts else 'unknown'
+            chapter_slug = '/'.join(parts[1:]) if len(parts) > 1 else 'index'
+            pairs.append({
+                'title_slug': title_slug,
+                'chapter_slug': chapter_slug,
+                'stage_path': stage_file,
+                'preview_path': preview_file,
+                'rel_path': str(Path('en') / 'documentation' / product / version / 'html' / rel),
+            })
+    return pairs
+
+
+def open_browser(headless=True):
+    """Launch Chromium for screenshots."""
     p = sync_playwright().start()
-    browser = p.firefox.launch_persistent_context(
-        SESSION_DIR,
-        headless=headless,
+    browser = p.chromium.launch(headless=headless)
+    page = browser.new_page(
         viewport={"width": 1400, "height": 900},
         ignore_https_errors=True,
     )
-    page = browser.pages[0] if browser.pages else browser.new_page()
     return p, browser, page
 
 
-def _full_page_screenshot(page, path):
-    """Take a full-page screenshot.
+def _render_to_png(source, output_path, page, strip_styles=False):
+    """Render HTML to PNG screenshot.
 
-    Red Hat docs pages use a fixed-height layout with a scrollable inner
-    container (#app-content). We expand all scrollable containers to their
-    full scroll height, resize the viewport to match, and take the screenshot.
+    Args:
+        source: Path (local file) or str (URL)
+        output_path: Where to save the PNG
+        page: Playwright page
+        strip_styles: Remove CSS/JS before screenshot (for raw HTML rendering)
     """
-    # Scroll the main content container to trigger lazy loading
-    page.evaluate("""() => {
-        const container = document.querySelector('#app-content') || document.body;
-        return new Promise((resolve) => {
-            let totalHeight = 0;
-            const distance = 2000;
-            const timer = setInterval(() => {
-                container.scrollBy(0, distance);
-                totalHeight += distance;
-                if (totalHeight >= container.scrollHeight) {
-                    clearInterval(timer);
-                    container.scrollTo(0, 0);
-                    resolve();
-                }
-            }, 50);
-        });
-    }""")
-
-    # Expand scrollable containers and get full height
-    full_height = page.evaluate("""() => {
-        let maxH = document.documentElement.scrollHeight;
-        for (const el of document.querySelectorAll('*')) {
-            if (el.scrollHeight > el.clientHeight + 50) {
-                el.style.overflow = 'visible';
-                el.style.maxHeight = 'none';
-                el.style.height = 'auto';
-                maxH = Math.max(maxH, el.scrollHeight);
-            }
-        }
-        document.documentElement.style.overflow = 'visible';
-        document.documentElement.style.height = 'auto';
-        document.body.style.overflow = 'visible';
-        document.body.style.height = 'auto';
-        return Math.max(maxH, document.documentElement.scrollHeight, document.body.scrollHeight);
-    }""")
-
-    # Resize viewport to full content height (no reset — kept expanded)
-    page.set_viewport_size({"width": 1400, "height": full_height})
-    page.screenshot(path=str(path))
+    url = f"file://{source}" if isinstance(source, Path) else source
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    if strip_styles:
+        page.evaluate("""() => {
+            document.querySelectorAll(
+                'link[rel="stylesheet"], style, script'
+            ).forEach(e => e.remove());
+        }""")
+    page.screenshot(path=str(output_path), full_page=True)
 
 
 def slugify(name):
@@ -685,239 +688,216 @@ def cmd_diff(args):
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    p, browser, page = open_browser(args.fresh, args.headless)
+    if args.mode == "pantheon":
+        # Phase 1+2: Mirror both environments with wget
+        for env in ('stage', 'preview'):
+            url = splash_url(env, args.product, args.version)
+            mirror_dir = CACHE_DIR / 'mirror' / env
+            print(f"Mirroring {env}: {url}")
+            t0 = time.time()
+            wget_mirror(url, mirror_dir)
+            print(f"  done ({time.time() - t0:.1f}s)")
 
-    try:
-        if args.mode == "pantheon":
-            # Pantheon mode: crawl chapters for each title
-            preview = splash_url('preview', args.product, args.version)
-            stage = splash_url('stage', args.product, args.version)
+        # Phase 3: Find matching page pairs
+        pairs = find_page_pairs(args.product, args.version)
 
-            print(f"Scraping preview: {preview}")
-            preview_links = scrape_title_links(preview, args.product, args.version)
-            print(f"Scraping stage:   {stage}")
-            stage_links = scrape_title_links(stage, args.product, args.version)
+        if args.title:
+            pairs = [p for p in pairs
+                     if any(t.lower() in p['title_slug'].lower() for t in args.title)]
 
-            stage_by_name = dict(stage_links)
-            preview_by_name = dict(preview_links)
-            all_names = sorted(set(list(stage_by_name) + list(preview_by_name)))
+        print(f"\nFound {len(pairs)} matching pages")
 
-            if args.title:
-                all_names = [n for n in all_names
-                             if any(t.lower() in n.lower() for t in args.title)]
+        # Phase 4: Compare text locally, render changed pages
+        p, browser, page = open_browser(args.headless)
+        try:
+            summary = []
+            for i, pair in enumerate(pairs):
+                title = pair['title_slug'].replace('_', ' ').title()
+                ch = pair['chapter_slug']
+                # Strip .html extension added by --adjust-extension
+                ch_clean = re.sub(r'\.html?$', '', ch, flags=re.IGNORECASE)
+                chapter = ch_clean.replace('-', ' ').replace('_', ' ').title() if ch_clean != 'index' else None
+                slug = slugify(f"{pair['title_slug']}_{pair['chapter_slug']}")
+                display = f"{title} / {chapter}" if chapter else title
 
-            # Build list of (title_name, chapter_name, a_url, b_url) items
-            comparisons = []
-            for title_name in all_names:
-                stage_title_url = stage_by_name.get(title_name, '')
-                preview_title_url = preview_by_name.get(title_name, '')
+                print(f"[{i+1}/{len(pairs)}] {display}")
 
-                if not stage_title_url or not preview_title_url:
-                    missing = 'stage' if not stage_title_url else 'preview'
-                    comparisons.append({
-                        'title': title_name,
-                        'chapter': None,
-                        'a_url': stage_title_url,
-                        'b_url': preview_title_url,
-                        'status': 'skipped',
-                        'detail': f'No {missing} URL'
-                    })
-                    continue
+                stage_url = f"{CONTENT_BASE['stage']}/{pair['rel_path']}"
+                preview_url = f"{CONTENT_BASE['preview']}/{pair['rel_path']}"
 
-                # Extract title slug and crawl chapters
-                title_slug = extract_title_slug(stage_title_url, args.product, args.version)
-                if not title_slug:
-                    comparisons.append({
-                        'title': title_name,
-                        'chapter': None,
-                        'a_url': stage_title_url,
-                        'b_url': preview_title_url,
-                        'status': 'error',
-                        'detail': 'Could not extract title slug'
-                    })
-                    continue
-
+                # Local text comparison (fast — no network)
                 try:
-                    # Scrape chapters from stage
-                    stage_chapters = scrape_chapter_links(stage_title_url,
-                                                         args.product, args.version, title_slug)
-                    preview_chapters = scrape_chapter_links(preview_title_url,
-                                                           args.product, args.version, title_slug)
-
-                    stage_ch_by_name = dict(stage_chapters)
-                    preview_ch_by_name = dict(preview_chapters)
-                    all_chapters = sorted(set(list(stage_ch_by_name) + list(preview_ch_by_name)))
-
-                    for chapter_name in all_chapters:
-                        comparisons.append({
-                            'title': title_name,
-                            'chapter': chapter_name,
-                            'a_url': stage_ch_by_name.get(chapter_name, ''),
-                            'b_url': preview_ch_by_name.get(chapter_name, ''),
-                        })
-
+                    stage_text = BeautifulSoup(
+                        pair['stage_path'].read_text(errors='replace'),
+                        'html.parser'
+                    ).get_text(strip=True)
+                    preview_text = BeautifulSoup(
+                        pair['preview_path'].read_text(errors='replace'),
+                        'html.parser'
+                    ).get_text(strip=True)
                 except Exception as e:
-                    comparisons.append({
-                        'title': title_name,
-                        'chapter': None,
-                        'a_url': stage_title_url,
-                        'b_url': preview_title_url,
-                        'status': 'error',
-                        'detail': f'Chapter crawl failed: {e}'
+                    print(f"  ERROR reading: {e}")
+                    summary.append({
+                        'title': title, 'chapter': chapter, 'slug': slug,
+                        'a_url': stage_url, 'b_url': preview_url,
+                        'status': 'error', 'detail': str(e),
+                    })
+                    continue
+
+                if stage_text == preview_text:
+                    print("  identical (text match)")
+                    summary.append({
+                        'title': title, 'chapter': chapter, 'slug': slug,
+                        'a_url': stage_url, 'b_url': preview_url,
+                        'status': 'identical', 'change_pct': 0.0,
+                    })
+                    continue
+
+                # Text differs — render to PNG and compare visually
+                try:
+                    a_path = output_dir / f"{slug}_a.png"
+                    b_path = output_dir / f"{slug}_b.png"
+                    _render_to_png(pair['stage_path'], a_path, page, strip_styles=True)
+                    _render_to_png(pair['preview_path'], b_path, page, strip_styles=True)
+
+                    status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
+                    print(f"  {status.upper() if status == 'changed' else status}")
+                    if status == 'changed':
+                        print(f"  {change_pct:.2f}% changed")
+
+                    summary.append({
+                        'title': title, 'chapter': chapter, 'slug': slug,
+                        'a_url': stage_url, 'b_url': preview_url,
+                        'status': status, 'change_pct': change_pct,
+                    })
+                except Exception as e:
+                    print(f"  ERROR: {e}")
+                    summary.append({
+                        'title': title, 'chapter': chapter, 'slug': slug,
+                        'a_url': stage_url, 'b_url': preview_url,
+                        'status': 'error', 'detail': str(e),
                     })
 
             label_a = "Stage"
             label_b = "Preview"
 
-        else:
-            # PR mode: simple per-title comparison (no chapter crawling)
-            env_a, env_b = resolve_pr_envs(args)
+        finally:
+            browser.close()
+            p.stop()
 
-            print(f"Scraping env-a: {env_a}")
-            a_links = scrape_title_links_from_build(env_a)
-            print(f"Scraping env-b: {env_b}")
-            b_links = scrape_title_links_from_build(env_b)
+    else:
+        # PR mode: scrape links, render remote URLs
+        env_a, env_b = resolve_pr_envs(args)
 
-            a_by_name = dict(a_links)
-            b_by_name = dict(b_links)
-            all_names = sorted(set(list(a_by_name) + list(b_by_name)))
+        print(f"Scraping env-a: {env_a}")
+        a_links = scrape_title_links_from_build(env_a)
+        print(f"Scraping env-b: {env_b}")
+        b_links = scrape_title_links_from_build(env_b)
 
-            if args.title:
-                all_names = [n for n in all_names
-                             if any(t.lower() in n.lower() for t in args.title)]
+        a_by_name = dict(a_links)
+        b_by_name = dict(b_links)
+        all_names = sorted(set(list(a_by_name) + list(b_by_name)))
 
-            # Build list of (title_name, a_url, b_url) items
-            comparisons = []
-            for title_name in all_names:
+        if args.title:
+            all_names = [n for n in all_names
+                         if any(t.lower() in n.lower() for t in args.title)]
+
+        p, browser, page = open_browser(args.headless)
+        try:
+            summary = []
+            for i, title_name in enumerate(all_names):
                 a_url = a_by_name.get(title_name, '')
                 b_url = b_by_name.get(title_name, '')
-                comparisons.append({
-                    'title': title_name,
-                    'chapter': None,
-                    'a_url': a_url,
-                    'b_url': b_url,
-                })
+                slug = slugify(title_name)
+
+                print(f"[{i+1}/{len(all_names)}] {title_name}")
+
+                if not a_url or not b_url:
+                    missing = 'A' if not a_url else 'B'
+                    print(f"  SKIP: no {missing} URL")
+                    summary.append({
+                        'title': title_name, 'chapter': None, 'slug': slug,
+                        'a_url': a_url, 'b_url': b_url,
+                        'status': 'skipped', 'detail': f'No {missing} URL',
+                    })
+                    continue
+
+                try:
+                    # Text comparison via HTTP
+                    try:
+                        text_a = _fetch_html(a_url).get_text(strip=True)
+                        text_b = _fetch_html(b_url).get_text(strip=True)
+                        if text_a == text_b:
+                            print("  identical (text match)")
+                            summary.append({
+                                'title': title_name, 'chapter': None, 'slug': slug,
+                                'a_url': a_url, 'b_url': b_url,
+                                'status': 'identical', 'change_pct': 0.0,
+                            })
+                            continue
+                    except Exception:
+                        pass
+
+                    a_path = output_dir / f"{slug}_a.png"
+                    b_path = output_dir / f"{slug}_b.png"
+                    _render_to_png(a_url, a_path, page)
+                    _render_to_png(b_url, b_path, page)
+
+                    status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
+                    print(f"  {status.upper() if status == 'changed' else status}")
+                    if status == 'changed':
+                        print(f"  {change_pct:.2f}% changed")
+
+                    summary.append({
+                        'title': title_name, 'chapter': None, 'slug': slug,
+                        'a_url': a_url, 'b_url': b_url,
+                        'status': status, 'change_pct': change_pct,
+                    })
+                except Exception as e:
+                    print(f"  ERROR: {e}")
+                    summary.append({
+                        'title': title_name, 'chapter': None, 'slug': slug,
+                        'a_url': a_url, 'b_url': b_url,
+                        'status': 'error', 'detail': str(e),
+                    })
 
             label_a = "Env A"
             label_b = "Env B"
 
-        # Screenshot and compare each item
-        print(f"\nComparing {len(comparisons)} pages\n")
-        summary = []
+        finally:
+            browser.close()
+            p.stop()
 
-        for i, item in enumerate(comparisons):
-            title = item['title']
-            chapter = item.get('chapter')
-            a_url = item.get('a_url', '')
-            b_url = item.get('b_url', '')
+    # Report
+    generate_report(output_dir, summary, label_a, label_b)
+    changed = sum(1 for s in summary if s.get('status') == 'changed')
+    identical = sum(1 for s in summary if s.get('status') == 'identical')
+    errors = sum(1 for s in summary if s.get('status') in ('error', 'skipped'))
+    print(f"\nDone. Changed: {changed}, Identical: {identical}, Errors: {errors}")
+    print(f"Report: {output_dir / 'index.html'}")
 
-            # Check for pre-existing errors
-            if 'status' in item:
-                print(f"[{i+1}/{len(comparisons)}] {title} / {chapter or '(index)'}: {item['status']}")
-                summary.append(item)
-                continue
+    if args.output_json:
+        json_path = output_dir / 'results.json'
+        json_path.write_text(json.dumps(summary, indent=2))
+        print(f"JSON:   {json_path}")
 
-            # Build slug from title + chapter
-            if chapter:
-                slug = slugify(f"{title}_{chapter}")
-                display_name = f"{title} / {chapter}"
-            else:
-                slug = slugify(title)
-                display_name = title
-
-            print(f"[{i+1}/{len(comparisons)}] {display_name}")
-
-            if not a_url or not b_url:
-                missing = 'A' if not a_url else 'B'
-                print(f"  SKIP: no {missing} URL")
-                item['status'] = 'skipped'
-                item['detail'] = f'No {missing} URL'
-                summary.append(item)
-                continue
-
-            try:
-                # Quick text comparison via HTTP to skip identical pages
-                try:
-                    soup_a = _fetch_html(a_url)
-                    soup_b = _fetch_html(b_url)
-                    text_a = soup_a.get_text(strip=True)
-                    text_b = soup_b.get_text(strip=True)
-                    if text_a == text_b:
-                        print("  identical (text match)")
-                        item['slug'] = slug
-                        item['status'] = 'identical'
-                        item['change_pct'] = 0.0
-                        summary.append(item)
-                        continue
-                except Exception:
-                    pass  # Fall through to visual comparison
-
-                # Text differs — take full screenshots
-                page.goto(a_url, wait_until="networkidle", timeout=120000)
-                time.sleep(1)
-                _dismiss_overlays(page)
-                a_path = output_dir / f"{slug}_a.png"
-                _full_page_screenshot(page, a_path)
-
-                page.goto(b_url, wait_until="networkidle", timeout=120000)
-                time.sleep(1)
-                _dismiss_overlays(page)
-                b_path = output_dir / f"{slug}_b.png"
-                _full_page_screenshot(page, b_path)
-
-                # Compare
-                status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
-                print(f"  {status.upper() if status == 'changed' else status}")
-                if status == 'changed':
-                    print(f"  {change_pct:.2f}% changed")
-
-                item['slug'] = slug
-                item['status'] = status
-                item['change_pct'] = change_pct
-                summary.append(item)
-
-            except Exception as e:
-                print(f"  ERROR: {e}")
-                item['slug'] = slug
-                item['status'] = 'error'
-                item['detail'] = str(e)
-                summary.append(item)
-
-        generate_report(output_dir, summary, label_a, label_b)
-        changed = sum(1 for s in summary if s.get('status') == 'changed')
-        identical = sum(1 for s in summary if s.get('status') == 'identical')
-        errors = sum(1 for s in summary if s.get('status') in ('error', 'skipped'))
-        print(f"\nDone. Changed: {changed}, Identical: {identical}, Errors: {errors}")
-        print(f"Report: {output_dir / 'index.html'}")
-
-        # Optional JSON output
-        if args.output_json:
-            json_path = output_dir / 'results.json'
-            json_path.write_text(json.dumps(summary, indent=2))
-            print(f"JSON:   {json_path}")
-
-        # Optional Markdown output
-        if args.output_markdown:
-            md_lines = ["# Visual Diff Summary\n"]
-            for s in summary:
-                if s.get('status') == 'changed':
-                    title = s.get('title', 'Unknown')
-                    chapter = s.get('chapter')
-                    slug = s.get('slug', '')
-                    change_pct = s.get('change_pct', 0)
-                    display = f"{title} / {chapter}" if chapter else title
-                    md_lines.append(f"## {display}\n")
-                    md_lines.append(f"- Change: {change_pct:.2f}%\n")
-                    md_lines.append(f"- Annotated A: `{slug}_a_annotated.png`\n")
-                    md_lines.append(f"- Annotated B: `{slug}_b_annotated.png`\n")
-                    md_lines.append("\n")
-            md_path = output_dir / 'summary.md'
-            md_path.write_text("".join(md_lines))
-            print(f"Markdown: {md_path}")
-
-    finally:
-        browser.close()
-        p.stop()
+    if args.output_markdown:
+        md_lines = ["# Visual Diff Summary\n"]
+        for s in summary:
+            if s.get('status') == 'changed':
+                title = s.get('title', 'Unknown')
+                chapter = s.get('chapter')
+                slug = s.get('slug', '')
+                change_pct = s.get('change_pct', 0)
+                display = f"{title} / {chapter}" if chapter else title
+                md_lines.append(f"## {display}\n")
+                md_lines.append(f"- Change: {change_pct:.2f}%\n")
+                md_lines.append(f"- Annotated A: `{slug}_a_annotated.png`\n")
+                md_lines.append(f"- Annotated B: `{slug}_b_annotated.png`\n")
+                md_lines.append("\n")
+        md_path = output_dir / 'summary.md'
+        md_path.write_text("".join(md_lines))
+        print(f"Markdown: {md_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -935,7 +915,8 @@ Modes:
 
 Prerequisites (Pantheon mode):
   - VPN connection to Red Hat network
-  - Playwright Firefox (installed via setup.sh)
+  - wget (for mirroring)
+  - Playwright Chromium (installed via setup.sh)
 
 Examples (Pantheon mode):
   visual-diff urls --pantheon-version 1.9
@@ -956,10 +937,6 @@ Examples (PR mode):
     common.add_argument(
         "--title", action="append",
         help="Filter titles by substring (repeatable; default: all)"
-    )
-    common.add_argument(
-        "--fresh", action="store_true",
-        help="Clear browser session"
     )
     common.add_argument(
         "--headless", action="store_true",
