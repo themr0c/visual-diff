@@ -21,8 +21,8 @@
 | 1 | Migration + self-bootstrapping | Done |
 | 2 | Parallel fetch + two-phase CLI + content-only diff | Done |
 | 3 | Rename/split detection + self-contained HTML report | Done |
-| 4 | Claude plugin (agent + commands) | **Next** |
-| 5 | GitHub Action for PR comments | Planned |
+| 4 | Claude plugin (agent + commands) | Done |
+| 5 | GitHub Action for PR comments | **Next** |
 
 ---
 
@@ -30,17 +30,26 @@
 
 ```
 .claude/plugins/visual-diff/
-├── plugin.json                       # Plugin manifest
+├── plugin.json                       # Plugin manifest (canonical copy)
 ├── agents/
 │   └── visual-diff-agent.md          # Agent definition
 └── commands/
     ├── visual-diff.md                # /visual-diff command
     └── visual-diff-urls.md           # /visual-diff-urls command
 
+.claude/                              # Auto-discovered by Claude Code
+├── agents/
+│   └── visual-diff-agent.md          # Symlinked/copied — enables agent
+└── commands/
+    ├── visual-diff.md                # Enables /visual-diff slash command
+    └── visual-diff-urls.md           # Enables /visual-diff-urls slash command
+
 action/
 ├── action.yml                        # Composite GitHub Action
 └── example-workflow.yml              # Reference workflow (not deployed here)
 ```
+
+> **Note (Phase 4 as implemented):** Claude Code's plugin loading system requires explicit installation. For project-local use, components were also placed in `.claude/commands/` and `.claude/agents/` which Claude Code auto-discovers. The `.claude/plugins/visual-diff/` copy serves as canonical source. Agent frontmatter uses `model: inherit` and `color: yellow` (not `orange`) and `argument-hint:` string (not `arguments:` list).
 
 ---
 
@@ -52,14 +61,14 @@ action/
 
 - Create: `.claude/plugins/visual-diff/plugin.json`
 
-- [ ] **Step 1: Create directory structure**
+- [x] **Step 1: Create directory structure**
 
 ```bash
 mkdir -p .claude/plugins/visual-diff/agents
 mkdir -p .claude/plugins/visual-diff/commands
 ```
 
-- [ ] **Step 2: Write plugin.json**
+- [x] **Step 2: Write plugin.json**
 
 ```json
 {
@@ -70,7 +79,7 @@ mkdir -p .claude/plugins/visual-diff/commands
 }
 ```
 
-- [ ] **Step 3: Verify JSON is valid**
+- [x] **Step 3: Verify JSON is valid**
 
 ```bash
 python3 -c "import json; json.load(open('.claude/plugins/visual-diff/plugin.json')); print('OK')"
@@ -78,7 +87,7 @@ python3 -c "import json; json.load(open('.claude/plugins/visual-diff/plugin.json
 
 Expected: `OK`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add .claude/plugins/visual-diff/plugin.json
@@ -93,7 +102,7 @@ git commit -m "feat: add Claude plugin manifest"
 
 - Create: `.claude/plugins/visual-diff/agents/visual-diff-agent.md`
 
-- [ ] **Step 1: Write the agent**
+- [x] **Step 1: Write the agent**
 
 ````markdown
 ---
@@ -150,7 +159,7 @@ Do NOT try to render or open `reports/index.html` in a browser. Read `reports/su
 - If the user asks for a URL list instead of a diff, run `scripts/visual-diff urls` instead
 ````
 
-- [ ] **Step 2: Verify the file is valid Markdown with correct frontmatter**
+- [x] **Step 2: Verify the file is valid Markdown with correct frontmatter**
 
 ```bash
 python3 -c "
@@ -164,7 +173,7 @@ print('OK')
 
 Expected: `OK`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add .claude/plugins/visual-diff/agents/visual-diff-agent.md
@@ -180,7 +189,7 @@ git commit -m "feat: add visual-diff Claude agent"
 - Create: `.claude/plugins/visual-diff/commands/visual-diff.md`
 - Create: `.claude/plugins/visual-diff/commands/visual-diff-urls.md`
 
-- [ ] **Step 1: Write /visual-diff command**
+- [x] **Step 1: Write /visual-diff command**
 
 ````markdown
 ---
@@ -201,7 +210,7 @@ scripts/visual-diff diff --headless --output reports/ $ARGUMENTS
 After the command completes, read `reports/summary.md` and provide a plain-language summary: how many pages changed, which books were affected, any renames or structural splits detected.
 ````
 
-- [ ] **Step 2: Write /visual-diff-urls command**
+- [x] **Step 2: Write /visual-diff-urls command**
 
 ````markdown
 ---
@@ -220,7 +229,7 @@ scripts/visual-diff urls $ARGUMENTS
 ```
 ````
 
-- [ ] **Step 3: Verify both files exist and have frontmatter**
+- [x] **Step 3: Verify both files exist and have frontmatter**
 
 ```bash
 python3 -c "
@@ -235,7 +244,7 @@ for f in ['.claude/plugins/visual-diff/commands/visual-diff.md',
 
 Expected: both files print `OK`
 
-- [ ] **Step 4: Verify full plugin structure**
+- [x] **Step 4: Verify full plugin structure**
 
 ```bash
 find .claude/plugins/visual-diff -type f | sort
@@ -250,7 +259,7 @@ Expected:
 .claude/plugins/visual-diff/plugin.json
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add .claude/plugins/visual-diff/commands/
