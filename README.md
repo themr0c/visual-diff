@@ -61,8 +61,8 @@ Reports go to `reports/` by default (`--output` to change):
 
 - `index.html` — self-contained report with all screenshots embedded as base64 (attach to Jira, open offline)
 - `summary.md` — compact Markdown for GitHub PR comments
-- `{slug}_a.png` / `{slug}_b.png` — raw screenshots
-- `{slug}_a_annotated.png` / `{slug}_b_annotated.png` — annotated (changed regions highlighted)
+- `raw_screenshots/{slug}_a.png` / `raw_screenshots/{slug}_b.png` — raw screenshots
+- `annotated_screenshots/{slug}_a_annotated.png` / `annotated_screenshots/{slug}_b_annotated.png` — annotated (changed regions highlighted)
 
 ## How it works
 

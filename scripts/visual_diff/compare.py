@@ -33,7 +33,7 @@ def _merge_cells_to_bboxes(cells, cell_size, max_w, max_h, padding_x=12, padding
     return merged
 
 
-def compare_screenshots(a_path, b_path, output_dir, slug):
+def compare_screenshots(a_path, b_path, annotated_dir, slug):
     """Compare two screenshots and produce annotated versions.
 
     Returns ('identical'|'changed', change_pct).
@@ -78,6 +78,6 @@ def compare_screenshots(a_path, b_path, output_dir, slug):
         for x1, y1, x2, y2 in bboxes:
             region = arr[y1:y2, x1:x2].astype(np.float32)
             result[y1:y2, x1:x2] = np.clip(region * 0.88 + amber * 0.12, 0, 255).astype(np.uint8)
-        Image.fromarray(result).save(str(output_dir / f"{slug}_{suffix}_annotated.png"))
+        Image.fromarray(result).save(str(annotated_dir / f"{slug}_{suffix}_annotated.png"))
 
     return 'changed', change_pct

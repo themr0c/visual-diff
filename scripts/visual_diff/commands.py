@@ -116,7 +116,7 @@ def _process_split(pair, title, chapter, slug, a_url, b_url, output_dir, page, h
     """Screenshot a split page and return a summary entry dict."""
     before_path = pair['before_path']
     content_sel = detect_content_selector(html)
-    a_path = output_dir / f"{slug}_a.png"
+    a_path = output_dir / 'raw_screenshots' / f"{slug}_a.png"
     try:
         _render_to_png(before_path, a_path, page, content_selector=content_sel)
         children = []
@@ -140,7 +140,8 @@ def _process_new_or_removed(pair, title, chapter, slug, a_url, b_url, output_dir
     after_path  = pair['after_path']
     status = 'new' if before_path is None else 'removed'
     src    = after_path if before_path is None else before_path
-    out_path = (output_dir / f"{slug}_b.png") if status == 'new' else (output_dir / f"{slug}_a.png")
+    raw_dir  = output_dir / 'raw_screenshots'
+    out_path = (raw_dir / f"{slug}_b.png") if status == 'new' else (raw_dir / f"{slug}_a.png")
     try:
         _render_to_png(src, out_path, page, content_selector=content_sel)
         print(f"  {status.upper()}")
@@ -171,18 +172,20 @@ def _process_changed_or_renamed(pair, title, chapter, slug, a_url, b_url,
     after_path  = pair['after_path']
     is_rename   = pair.get('status_hint') == 'renamed'
     content_sel = detect_content_selector(before_html)
+    raw_dir = output_dir / 'raw_screenshots'
+    ann_dir = output_dir / 'annotated_screenshots'
     try:
-        a_path = output_dir / f"{slug}_a.png"
-        b_path = output_dir / f"{slug}_b.png"
+        a_path = raw_dir / f"{slug}_a.png"
+        b_path = raw_dir / f"{slug}_b.png"
         _render_to_png(before_path, a_path, page, content_selector=content_sel)
         _render_to_png(after_path,  b_path, page, content_selector=content_sel)
 
         if is_rename:
-            _, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
+            _, change_pct = compare_screenshots(a_path, b_path, ann_dir, slug)
             status = 'renamed'
             print(f"  RENAMED ({change_pct:.2f}%)")
         else:
-            status, change_pct = compare_screenshots(a_path, b_path, output_dir, slug)
+            status, change_pct = compare_screenshots(a_path, b_path, ann_dir, slug)
             print(f"  {'CHANGED' if status == 'changed' else status}"
                   + (f" ({change_pct:.2f}%)" if status == 'changed' else ''))
         return {'title': title, 'chapter': chapter, 'slug': slug,
@@ -244,6 +247,8 @@ def cmd_compare(args):
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
+    (output_dir / 'raw_screenshots').mkdir()
+    (output_dir / 'annotated_screenshots').mkdir()
 
     is_pantheon = (args.mode == 'pantheon')
     product = getattr(args, 'pantheon_product', None)

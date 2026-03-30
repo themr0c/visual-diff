@@ -66,8 +66,8 @@ The entry point is `scripts/visual-diff` (thin bootstrap). Logic lives in the `s
 
 - `index.html` — self-contained HTML with base64-embedded screenshots (shareable as a single file)
 - `summary.md` — compact Markdown for GitHub/Jira comments
-- `{slug}_a.png` / `{slug}_b.png` — raw screenshots
-- `{slug}_a_annotated.png` / `{slug}_b_annotated.png` — annotated screenshots
+- `raw_screenshots/{slug}_a.png` / `raw_screenshots/{slug}_b.png` — raw screenshots
+- `annotated_screenshots/{slug}_a_annotated.png` / `annotated_screenshots/{slug}_b_annotated.png` — annotated screenshots
 
 ## Dependencies
 

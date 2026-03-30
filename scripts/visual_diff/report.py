@@ -77,7 +77,7 @@ def _section_new(s, output_dir, label_b):
     chapter = s.get('chapter', '')
     title   = s.get('title', '')
     chapter_title = f"{title} / {chapter}" if chapter else title
-    b_img = _img_tag(output_dir / f"{slug}_b.png", label_b)
+    b_img = _img_tag(output_dir / 'raw_screenshots' / f"{slug}_b.png", label_b)
     html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-new">NEW</span></h3>
@@ -100,7 +100,7 @@ def _section_removed(s, output_dir, label_a):
     chapter = s.get('chapter', '')
     title   = s.get('title', '')
     chapter_title = f"{title} / {chapter}" if chapter else title
-    a_img = _img_tag(output_dir / f"{slug}_a.png", label_a)
+    a_img = _img_tag(output_dir / 'raw_screenshots' / f"{slug}_a.png", label_a)
     html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-removed">REMOVED</span></h3>
@@ -125,7 +125,7 @@ def _section_split(s, output_dir, label_a, label_b):
     children = s.get('split_children', [])
     chapter_title  = f"{title} / {chapter}" if chapter else title
     children_html  = ''.join(f'<li>{c}</li>' for c in children)
-    a_img = _img_tag(output_dir / f"{slug}_a.png", label_a)
+    a_img = _img_tag(output_dir / 'raw_screenshots' / f"{slug}_a.png", label_a)
     html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-split">SPLIT</span></h3>
@@ -146,12 +146,14 @@ def _section_split(s, output_dir, label_a, label_b):
 
 def _annotated_img_tags(output_dir, slug, label_a, label_b):
     """Return (a_img, b_img) using annotated PNGs, falling back to raw."""
-    a_png = output_dir / f"{slug}_a_annotated.png"
-    b_png = output_dir / f"{slug}_b_annotated.png"
+    ann_dir = output_dir / 'annotated_screenshots'
+    raw_dir = output_dir / 'raw_screenshots'
+    a_png = ann_dir / f"{slug}_a_annotated.png"
+    b_png = ann_dir / f"{slug}_b_annotated.png"
     if not a_png.exists():
-        a_png = output_dir / f"{slug}_a.png"
+        a_png = raw_dir / f"{slug}_a.png"
     if not b_png.exists():
-        b_png = output_dir / f"{slug}_b.png"
+        b_png = raw_dir / f"{slug}_b.png"
     return _img_tag(a_png, label_a), _img_tag(b_png, label_b)
 
 
@@ -196,8 +198,9 @@ def _section_changed(s, output_dir, label_a, label_b):
     title   = s.get('title', '')
     pct     = s.get('change_pct', 0)
     chapter_title = f"{title} / {chapter}" if chapter else title
-    a_png = output_dir / f"{slug}_a_annotated.png"
-    b_png = output_dir / f"{slug}_b_annotated.png"
+    ann_dir = output_dir / 'annotated_screenshots'
+    a_png = ann_dir / f"{slug}_a_annotated.png"
+    b_png = ann_dir / f"{slug}_b_annotated.png"
     a_img = _img_tag(a_png, label_a)
     b_img = _img_tag(b_png, label_b)
     html = f'''
