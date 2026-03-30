@@ -20,7 +20,7 @@ The tool handles the full lifecycle: mirroring both environments, detecting stru
 | 1 | Migration from jirha + self-bootstrapping | **Done** |
 | 2 | Parallel wget mirroring + two-phase CLI + content-only diff + enhanced report | **Done** |
 | 3 | PR mode + rename/split detection + self-contained HTML report | **Done** |
-| 4 | Claude plugin (agent + commands) | Planned |
+| 4 | Claude plugin (agent + commands) + package refactor | **Done** |
 | 5 | GitHub Action for PR comments | Planned |
 
 ---
@@ -30,20 +30,37 @@ The tool handles the full lifecycle: mirroring both environments, detecting stru
 ```
 visual-diff/
 ├── scripts/
-│   └── visual-diff          # Single-file Python CLI (~1250 lines)
-├── requirements.txt         # beautifulsoup4, Pillow, numpy, playwright, requests
-├── .env.example             # PANTHEON_VERSION, PANTHEON_PRODUCT
-├── .cache/                  # wget mirrors (git-ignored)
-│   ├── before/              # stage (before)
-│   └── after/               # preview (after)
-├── reports/                 # output reports (git-ignored)
+│   ├── visual-diff             # Entry point: venv bootstrap + .env loader (~40 lines)
+│   └── visual_diff/            # Python package (one module per concern)
+│       ├── __init__.py
+│       ├── constants.py        # CACHE_DIR, CONTENT_BASE, CSS selectors
+│       ├── urls.py             # splash_url, scrape_title_links*
+│       ├── fetch.py            # wget_mirror, fetch_parallel, resolve_*
+│       ├── content.py          # extract_content_text, detect_content_selector
+│       ├── matching.py         # find_page_pairs, _detect_renames_and_splits
+│       ├── browser.py          # open_browser, _render_to_png
+│       ├── compare.py          # compare_screenshots, _merge_cells_to_bboxes
+│       ├── report.py           # generate_report, per-status section helpers
+│       └── commands.py         # cmd_*, main(), argparse
+├── requirements.txt            # beautifulsoup4, Pillow, numpy, playwright, requests
+├── .env.example                # PANTHEON_VERSION, PANTHEON_PRODUCT, GITHUB_PAGES_BASE
+├── .cache/                     # wget mirrors (git-ignored)
+│   ├── before/                 # stage (before)
+│   └── after/                  # preview (after)
+├── reports/                    # output reports (git-ignored)
+│   ├── index.html              # self-contained report
+│   ├── summary.md
+│   ├── raw_screenshots/        # before/after PNGs
+│   └── annotated_screenshots/  # highlighted diff PNGs
 ├── .claude/
-│   └── plugins/
-│       └── visual-diff/     # Claude plugin (Phase 4, not yet implemented)
-└── action/                  # GitHub Action (Phase 5, not yet implemented)
+│   ├── agents/visual-diff-agent.md       # auto-discovered by Claude Code
+│   ├── commands/visual-diff.md           # /visual-diff slash command
+│   ├── commands/visual-diff-urls.md      # /visual-diff-urls slash command
+│   └── plugins/visual-diff/             # canonical plugin source (requires install)
+└── action/                     # GitHub Action (Phase 5, planned)
 ```
 
-The script is self-bootstrapping: it creates `venv/`, installs dependencies, and re-execs itself under the venv on first run.
+The entry point is self-bootstrapping: it creates `venv/`, installs dependencies, and re-execs itself under the venv on first run.
 
 ---
 
@@ -62,7 +79,7 @@ visual-diff urls     List available titles from both environments
 | ---- | ----------- |
 | `--mode pantheon\|pr` | Comparison mode (auto-detected: `GITHUB_BASE_REF` set → `pr`, else → `pantheon`) |
 | `--pantheon-version VER` | Version e.g. `1.9` (or `$PANTHEON_VERSION`) |
-| `--pantheon-product PROD` | Product slug (or `$PANTHEON_PRODUCT`, default: `red_hat_developer_hub`) |
+| `--pantheon-product PROD` | Product slug (or `$PANTHEON_PRODUCT`) |
 | `--env-a URL\|PATH` | Before build — URL or local path (PR mode, or `$ENV_A`) |
 | `--env-b URL\|PATH` | After build — URL or local path (PR mode, or `$ENV_B`) |
 | `--before-dir DIR` | Before cache dir (default: `.cache/before/`) |
@@ -70,6 +87,8 @@ visual-diff urls     List available titles from both environments
 | `--output DIR` | Report output dir (default: `reports/`) |
 | `--title FILTER` | Filter titles by substring (repeatable) |
 | `--output-json` | Also write `results.json` |
+
+Browser always runs headless — there is no `--headless` flag.
 
 ### Modes
 
@@ -127,6 +146,8 @@ Result page statuses: `changed`, `renamed`, `split`, `new`, `removed`, `identica
 
 - `index.html` — self-contained HTML with all screenshots embedded as base64 data URIs; collapsible per-title sections; summary table
 - `summary.md` — compact Markdown (changed/renamed/split/new/removed entries with links)
+- `raw_screenshots/` — before/after PNGs for each changed page
+- `annotated_screenshots/` — highlighted diff PNGs
 
 The output directory is cleaned before each run.
 
@@ -145,17 +166,18 @@ The output directory is cleaned before each run.
 
 ---
 
-## Phase 4 — Claude Plugin (planned)
+## Phase 4 — Claude Plugin (done)
 
-A thin Claude Code plugin wrapping the CLI.
+A thin Claude Code plugin wrapping the CLI. Components live in two places:
 
-**Agent `visual-diff-agent`**: invokes `scripts/visual-diff` via Bash, interprets the report, and summarizes findings in natural language.
+- `.claude/plugins/visual-diff/` — canonical source (requires explicit plugin install)
+- `.claude/agents/` and `.claude/commands/` — auto-discovered by Claude Code without installation
 
-**Command `/visual-diff`**: runs `diff` with provided args, reports output path.
+**Agent `visual-diff-agent`**: invokes `scripts/visual-diff` via Bash, reads `reports/summary.md`, and summarizes findings in natural language.
+
+**Command `/visual-diff`**: runs `diff` with provided args, reads `reports/summary.md` and reports.
 
 **Command `/visual-diff-urls`**: runs `urls`, prints title list.
-
-Plugin manifest at `.claude/plugins/visual-diff/plugin.json`.
 
 ---
 

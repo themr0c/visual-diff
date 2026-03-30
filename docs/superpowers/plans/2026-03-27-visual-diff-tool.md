@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-03-27-visual-diff-tool-design.md`
 
-**Completed phases (do not re-implement):** Phases 1–3 are done. The CLI is fully functional with `fetch`, `compare`, `diff`, and `urls` commands. Cache is in `.cache/before/` and `.cache/after/`. Reports go to `reports/` by default.
+**Completed phases (do not re-implement):** Phases 1–4 are done. The CLI is a Python package (`scripts/visual_diff/`) with entry point `scripts/visual-diff`. Commands: `fetch`, `compare`, `diff`, `urls`. Cache: `.cache/before/` and `.cache/after/`. Reports: `reports/index.html`, `reports/summary.md`, `reports/raw_screenshots/`, `reports/annotated_screenshots/`. Browser always headless (no `--headless` flag). Claude plugin at `.claude/plugins/visual-diff/` (canonical) and `.claude/agents/` + `.claude/commands/` (auto-discovered).
 
 ---
 
@@ -21,7 +21,7 @@
 | 1 | Migration + self-bootstrapping | Done |
 | 2 | Parallel fetch + two-phase CLI + content-only diff | Done |
 | 3 | Rename/split detection + self-contained HTML report | Done |
-| 4 | Claude plugin (agent + commands) | Done |
+| 4 | Claude plugin (agent + commands) + package refactor | **Done** |
 | 5 | GitHub Action for PR comments | **Next** |
 
 ---
@@ -108,7 +108,8 @@ git commit -m "feat: add Claude plugin manifest"
 ---
 name: visual-diff-agent
 description: Runs visual regression comparisons between documentation builds. Use when the user asks to compare documentation versions, run a visual diff, check for visual regressions, or compare Pantheon stage vs preview builds.
-color: orange
+model: inherit
+color: yellow
 tools:
   - Bash
   - Read
@@ -194,10 +195,7 @@ git commit -m "feat: add visual-diff Claude agent"
 ---
 name: visual-diff
 description: Run a visual diff comparison between documentation builds and summarise the results
-arguments:
-  - name: args
-    description: "Optional: --mode pantheon|pr, --title FILTER, --output DIR, --env-a URL, --env-b URL"
-    required: false
+argument-hint: "[--mode pantheon|pr] [--title FILTER] [--output DIR] [--env-a URL] [--env-b URL] [--pantheon-version VER]"
 ---
 
 Run the visual-diff tool then summarise what changed.
@@ -215,10 +213,7 @@ After the command completes, read `reports/summary.md` and provide a plain-langu
 ---
 name: visual-diff-urls
 description: List available documentation title URLs from both environments
-arguments:
-  - name: args
-    description: "Optional: --mode pantheon|pr, --title FILTER, --json, --env-a URL, --env-b URL"
-    required: false
+argument-hint: "[--mode pantheon|pr] [--title FILTER] [--json] [--env-a URL] [--env-b URL]"
 ---
 
 List the documentation titles available for comparison.
