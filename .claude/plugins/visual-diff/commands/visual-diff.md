@@ -1,16 +1,13 @@
 ---
 name: visual-diff
-description: Run a visual diff comparison between documentation builds
-arguments:
-  - name: args
-    description: "Optional arguments: --mode pantheon|pr, --title FILTER, --output DIR, --headless, --env-a URL, --env-b URL"
-    required: false
+description: Run a visual diff and summarise changes
+argument-hint: "[--mode pantheon|pr] [--title FILTER] [--output DIR] [--env-a URL] [--env-b URL]"
 ---
 
-Run the visual-diff tool to compare documentation builds.
+Run the visual-diff tool then summarise what changed.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/visual-diff diff --headless --output /tmp/visual-diff-output/ $ARGUMENTS
+scripts/visual-diff diff --headless --output reports/ $ARGUMENTS
 ```
 
-After running, read the output report at `/tmp/visual-diff-output/index.html` and provide a summary of the changes found.
+After the command completes, read `reports/summary.md` and provide a plain-language summary: how many pages changed, which books were affected, any renames or structural splits detected.

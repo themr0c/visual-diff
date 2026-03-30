@@ -1,6 +1,5 @@
 {
   "name": "visual-diff",
-  "description": "Visual regression testing for Red Hat documentation builds. Compares Pantheon stage/preview or ccutil PR builds and generates side-by-side diff reports.",
-  "agents": ["agents/visual-diff-agent.md"],
-  "commands": ["commands/visual-diff.md", "commands/visual-diff-urls.md"]
+  "version": "0.1.0",
+  "description": "Visual regression testing for Red Hat documentation builds. Compares Pantheon stage/preview or ccutil PR builds and generates side-by-side diff reports."
 }
