@@ -19,19 +19,19 @@ The CLI is at `scripts/visual-diff` (relative to the repo root). It is self-boot
 Default (Pantheon stage vs preview, requires VPN):
 
 ```bash
-scripts/visual-diff diff --headless --output reports/
+scripts/visual-diff diff --output reports/
 ```
 
 With a title filter:
 
 ```bash
-scripts/visual-diff diff --headless --output reports/ --title "audit"
+scripts/visual-diff diff --output reports/ --title "audit"
 ```
 
 PR mode (two arbitrary builds, no VPN needed):
 
 ```bash
-scripts/visual-diff diff --mode pr --env-a PATH_OR_URL --env-b PATH_OR_URL --headless --output reports/
+scripts/visual-diff diff --mode pr --env-a PATH_OR_URL --env-b PATH_OR_URL --output reports/
 ```
 
 ## After running
@@ -47,7 +47,6 @@ Do NOT try to render or open `reports/index.html` in a browser. Read `reports/su
 
 ## Rules
 
-- Always use `--headless`
 - Always use `--output reports/` unless the user specifies otherwise
 - If the user mentions specific book titles, add `--title "keyword"` (repeatable)
 - If the user asks for a URL list instead of a diff, run `scripts/visual-diff urls` instead

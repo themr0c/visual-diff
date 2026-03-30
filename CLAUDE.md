@@ -18,11 +18,11 @@ cp .env.example .env  # set PANTHEON_VERSION and PANTHEON_PRODUCT
 
 ```bash
 # Fetch + compare in one shot
-scripts/visual-diff diff --pantheon-version 1.9 --headless
+scripts/visual-diff diff --pantheon-version 1.9
 
 # Two-phase (re-run compare without re-fetching)
 scripts/visual-diff fetch --pantheon-version 1.9
-scripts/visual-diff compare --headless --title "audit"
+scripts/visual-diff compare --title "audit"
 
 # PR mode
 scripts/visual-diff diff --mode pr --env-a ./build/ --env-b https://example.com/
@@ -33,7 +33,7 @@ scripts/visual-diff urls --pantheon-version 1.9
 
 ## Architecture
 
-Everything lives in `scripts/visual-diff` — a single ~1250-line Python file. Sections are delineated by comments.
+The entry point is `scripts/visual-diff` (thin bootstrap). Logic lives in the `scripts/visual_diff/` package.
 
 **Two comparison modes:**
 

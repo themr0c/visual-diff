@@ -38,11 +38,11 @@ visual-diff urls     List available titles from both environments
 
 ```bash
 # One-shot: fetch and compare
-visual-diff diff --pantheon-version 1.9 --headless
+visual-diff diff --pantheon-version 1.9
 
 # Two-phase: fetch once, re-run compare with different options
 visual-diff fetch --pantheon-version 1.9
-visual-diff compare --headless --title "audit"
+visual-diff compare --title "audit"
 
 # List titles
 visual-diff urls --pantheon-version 1.9

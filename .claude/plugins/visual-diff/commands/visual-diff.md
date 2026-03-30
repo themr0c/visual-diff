@@ -7,7 +7,7 @@ argument-hint: "[--mode pantheon|pr] [--title FILTER] [--output DIR] [--env-a UR
 Run the visual-diff tool then summarise what changed.
 
 ```bash
-scripts/visual-diff diff --headless --output reports/ $ARGUMENTS
+scripts/visual-diff diff --output reports/ $ARGUMENTS
 ```
 
 After the command completes, read `reports/summary.md` and provide a plain-language summary: how many pages changed, which books were affected, any renames or structural splits detected.

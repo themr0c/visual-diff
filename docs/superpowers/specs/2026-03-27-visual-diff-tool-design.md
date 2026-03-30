@@ -69,7 +69,6 @@ visual-diff urls     List available titles from both environments
 | `--after-dir DIR` | After cache dir (default: `.cache/after/`) |
 | `--output DIR` | Report output dir (default: `reports/`) |
 | `--title FILTER` | Filter titles by substring (repeatable) |
-| `--headless` | Run browser headless |
 | `--output-json` | Also write `results.json` |
 
 ### Modes
@@ -165,7 +164,7 @@ Plugin manifest at `.claude/plugins/visual-diff/plugin.json`.
 Runs on PR open/update in `red-hat-developers-documentation-rhdh`:
 
 1. Build PR branch: `build/scripts/build-ccutil.sh -b "pr-${{ github.event.number }}"`
-2. Run `visual-diff diff --mode pr --headless` — auto-detects `--env-a` from `GITHUB_EVENT_NUMBER` and `--env-b` from `GITHUB_BASE_REF`
+2. Run `visual-diff diff --mode pr` — auto-detects `--env-a` from `GITHUB_EVENT_NUMBER` and `--env-b` from `GITHUB_BASE_REF`
 3. Post `summary.md` as a PR comment via `gh`
 
 No VPN or authentication needed (ccutil builds are public GitHub Pages).

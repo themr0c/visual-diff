@@ -260,7 +260,7 @@ def cmd_compare(args):
 
     print(f"Found {len(pairs)} matching pages")
 
-    p, browser, page = open_browser(headless=args.headless, disable_js=is_pantheon)
+    p, browser, page = open_browser(headless=True, disable_js=is_pantheon)
     try:
         summary = [
             _process_pair(pair, i + 1, len(pairs), is_pantheon, output_dir, page)
@@ -307,9 +307,9 @@ Modes:
   pr        Compare two arbitrary builds (ccutil output, GitHub Pages, localhost).
 
 Examples:
-  visual-diff diff --pantheon-version 1.9 --output /tmp/diff-output/ --headless
+  visual-diff diff --pantheon-version 1.9 --output /tmp/diff-output/
   visual-diff fetch --pantheon-version 1.9
-  visual-diff compare --output /tmp/diff-output/ --headless
+  visual-diff compare --output /tmp/diff-output/
   visual-diff diff --mode pr --env-a ./build/ --env-b https://example.com/ --output /tmp/pr-diff/
   visual-diff urls --pantheon-version 1.9
 """,
@@ -323,8 +323,6 @@ Examples:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--title", action="append",
                         help="Filter titles by substring (repeatable)")
-    common.add_argument("--headless", action="store_true",
-                        help="Run browser in headless mode")
 
     pantheon_opts = argparse.ArgumentParser(add_help=False)
     pantheon_opts.add_argument(

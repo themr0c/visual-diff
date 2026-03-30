@@ -7,3 +7,5 @@ __pycache__/
 /tmp/
 *.png
 !/docs/**/*.png
+.remember/
+.claude/settings.local.json

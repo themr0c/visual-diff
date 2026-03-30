@@ -125,19 +125,19 @@ The CLI is at `scripts/visual-diff` (relative to the repo root). It is self-boot
 Default (Pantheon stage vs preview, requires VPN):
 
 ```bash
-scripts/visual-diff diff --headless --output reports/
+scripts/visual-diff diff --output reports/
 ```
 
 With a title filter:
 
 ```bash
-scripts/visual-diff diff --headless --output reports/ --title "audit"
+scripts/visual-diff diff --output reports/ --title "audit"
 ```
 
 PR mode (two arbitrary builds, no VPN needed):
 
 ```bash
-scripts/visual-diff diff --mode pr --env-a PATH_OR_URL --env-b PATH_OR_URL --headless --output reports/
+scripts/visual-diff diff --mode pr --env-a PATH_OR_URL --env-b PATH_OR_URL --output reports/
 ```
 
 ## After running
@@ -153,7 +153,6 @@ Do NOT try to render or open `reports/index.html` in a browser. Read `reports/su
 
 ## Rules
 
-- Always use `--headless`
 - Always use `--output reports/` unless the user specifies otherwise
 - If the user mentions specific book titles, add `--title "keyword"` (repeatable)
 - If the user asks for a URL list instead of a diff, run `scripts/visual-diff urls` instead
@@ -204,7 +203,7 @@ arguments:
 Run the visual-diff tool then summarise what changed.
 
 ```bash
-scripts/visual-diff diff --headless --output reports/ $ARGUMENTS
+scripts/visual-diff diff --output reports/ $ARGUMENTS
 ```
 
 After the command completes, read `reports/summary.md` and provide a plain-language summary: how many pages changed, which books were affected, any renames or structural splits detected.
@@ -318,8 +317,7 @@ runs:
       run: |
         python ${{ github.action_path }}/../scripts/visual-diff diff \
           --mode pr \
-          --output ${{ inputs.output-dir }} \
-          --headless
+          --output ${{ inputs.output-dir }}
       env:
         GITHUB_BASE_REF: ${{ github.base_ref }}
         GITHUB_EVENT_NUMBER: ${{ github.event.number }}
