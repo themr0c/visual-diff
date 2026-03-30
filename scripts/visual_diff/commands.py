@@ -112,14 +112,11 @@ def _build_urls(pair, is_pantheon):
     return a_url, b_url
 
 
-def _process_split(pair, title, slug, a_url, b_url, output_dir, page):
+def _process_split(pair, title, chapter, slug, a_url, b_url, output_dir, page, html):
     """Screenshot a split page and return a summary entry dict."""
     before_path = pair['before_path']
-    html = before_path.read_text(errors='replace')
-    chapter = extract_page_title(html) or None
     content_sel = detect_content_selector(html)
     a_path = output_dir / f"{slug}_a.png"
-    display = f"{title} / {chapter}" if chapter else title
     try:
         _render_to_png(before_path, a_path, page, content_selector=content_sel)
         children = []
@@ -135,20 +132,14 @@ def _process_split(pair, title, slug, a_url, b_url, output_dir, page):
         print(f"  ERROR: {e}")
         return {'title': title, 'chapter': chapter, 'slug': slug,
                 'a_url': a_url, 'b_url': b_url, 'status': 'error', 'detail': str(e)}
-    finally:
-        # display is used for the caller's print
-        _ = display
 
 
-def _process_new_or_removed(pair, title, slug, a_url, b_url, output_dir, page):
+def _process_new_or_removed(pair, title, chapter, slug, a_url, b_url, output_dir, page, content_sel):
     """Screenshot a new or removed page and return a summary entry dict."""
     before_path = pair['before_path']
     after_path  = pair['after_path']
     status = 'new' if before_path is None else 'removed'
     src    = after_path if before_path is None else before_path
-    html   = src.read_text(errors='replace')
-    chapter = extract_page_title(html) or None
-    content_sel = detect_content_selector(html)
     out_path = (output_dir / f"{slug}_b.png") if status == 'new' else (output_dir / f"{slug}_a.png")
     try:
         _render_to_png(src, out_path, page, content_selector=content_sel)
@@ -162,10 +153,7 @@ def _process_new_or_removed(pair, title, slug, a_url, b_url, output_dir, page):
 
 
 def _read_pair_content(pair):
-    """Read before/after HTML; return (before_html, after_html, before_text, after_text, chapter).
-
-    Returns None if reading fails (caller should add error entry).
-    """
+    """Read before/after HTML; return (before_html, before_text, after_text, chapter)."""
     before_path = pair['before_path']
     after_path  = pair['after_path']
     before_html = before_path.read_text(errors='replace')
@@ -173,7 +161,7 @@ def _read_pair_content(pair):
     before_text = extract_content_text(before_html)
     after_text  = extract_content_text(after_html)
     chapter = extract_page_title(before_html) or extract_page_title(after_html) or None
-    return before_html, after_html, before_text, after_text, chapter
+    return before_html, before_text, after_text, chapter
 
 
 def _process_changed_or_renamed(pair, title, chapter, slug, a_url, b_url,
@@ -214,21 +202,20 @@ def _process_pair(pair, i, total, is_pantheon, output_dir, page):
     if pair.get('status_hint') == 'split':
         html = pair['before_path'].read_text(errors='replace')
         chapter = extract_page_title(html) or None
-        display = f"{title} / {chapter}" if chapter else title
-        print(f"[{i}/{total}] {display}")
-        return _process_split(pair, title, slug, a_url, b_url, output_dir, page)
+        print(f"[{i}/{total}] {title + ' / ' + chapter if chapter else title}")
+        return _process_split(pair, title, chapter, slug, a_url, b_url, output_dir, page, html)
 
     if pair['before_path'] is None or pair['after_path'] is None:
         src = pair['after_path'] if pair['before_path'] is None else pair['before_path']
         html = src.read_text(errors='replace')
         chapter = extract_page_title(html) or None
-        display = f"{title} / {chapter}" if chapter else title
-        print(f"[{i}/{total}] {display}")
-        return _process_new_or_removed(pair, title, slug, a_url, b_url, output_dir, page)
+        content_sel = detect_content_selector(html)
+        print(f"[{i}/{total}] {title + ' / ' + chapter if chapter else title}")
+        return _process_new_or_removed(pair, title, chapter, slug, a_url, b_url, output_dir, page, content_sel)
 
     # Both sides present — read content and compare text first
     try:
-        before_html, after_html, before_text, after_text, chapter = _read_pair_content(pair)
+        before_html, before_text, after_text, chapter = _read_pair_content(pair)
     except Exception as e:
         print(f"  ERROR reading: {e}")
         return {'title': title, 'chapter': None, 'slug': slug,
@@ -249,11 +236,6 @@ def _process_pair(pair, i, total, is_pantheon, output_dir, page):
 
 def cmd_compare(args):
     """Phase 2: Compare mirrored pages and produce HTML report + summary.md."""
-    try:
-        from PIL import Image  # noqa: F401
-    except ImportError:
-        sys.exit("Error: Pillow is required. Run: pip install Pillow>=10.0")
-
     before_dir = Path(args.before_dir)
     after_dir  = Path(args.after_dir)
     _validate_compare_args(args, before_dir, after_dir)

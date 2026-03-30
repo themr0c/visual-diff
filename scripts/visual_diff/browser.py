@@ -1,6 +1,8 @@
 """Browser automation: launch Chromium, render pages to PNG."""
 
+import numpy as np
 from pathlib import Path
+from PIL import Image
 
 from playwright.sync_api import sync_playwright
 
@@ -23,8 +25,6 @@ def open_browser(headless=True, disable_js=False):
 
 def _trim_whitespace(img_path, margin=8, threshold=245):
     """Crop trailing (bottom) whitespace from a PNG screenshot."""
-    from PIL import Image
-    import numpy as np
     img = Image.open(str(img_path)).convert('RGB')
     arr = np.array(img)
     row_is_white = np.all(arr >= threshold, axis=(1, 2))

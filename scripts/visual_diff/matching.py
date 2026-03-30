@@ -1,6 +1,7 @@
 """Page matching: pair before/after HTML files; detect renames and splits."""
 
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -84,8 +85,6 @@ def _detect_renames_and_splits(pairs):
 
     if not (before_only and after_only):
         return
-
-    from difflib import SequenceMatcher
 
     def _h1(path):
         try:

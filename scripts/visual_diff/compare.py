@@ -1,5 +1,8 @@
 """Pixel-level screenshot comparison and annotation."""
 
+import numpy as np
+from PIL import Image
+
 
 def _merge_cells_to_bboxes(cells, cell_size, max_w, max_h, padding_x=12, padding_y=4):
     """Merge adjacent grid cells into bounding boxes with padding."""
@@ -37,9 +40,6 @@ def compare_screenshots(a_path, b_path, output_dir, slug):
     Annotated PNGs: dimmed unchanged areas, original pixels in changed bboxes,
     3px red border around each changed region.
     """
-    import numpy as np
-    from PIL import Image
-
     img_a = Image.open(a_path).convert('RGB')
     img_b = Image.open(b_path).convert('RGB')
 

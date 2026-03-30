@@ -4,6 +4,8 @@ import base64
 from collections import OrderedDict
 from pathlib import Path
 
+_NO_SCREENSHOT = '<em>no screenshot</em>'
+
 
 def slugify(name):
     """Convert a name to a filesystem-safe slug."""
@@ -17,124 +19,114 @@ def _img_to_data_uri(img_path):
     return f"data:image/png;base64,{base64.b64encode(data).decode()}"
 
 
-def generate_report(output_dir, summary, label_a="Before", label_b="After"):
-    """Generate index.html (self-contained, inline images) and summary.md.
+def _img_tag(png_path, label):
+    """Return an <img> tag with inline base64 src, or a no-screenshot placeholder."""
+    p = Path(png_path)
+    if p.exists():
+        return f'<img src="{_img_to_data_uri(p)}" alt="{label}">'
+    return _NO_SCREENSHOT
 
-    index.html embeds all annotated PNGs as base64 data URIs so the file
-    can be shared or attached without external dependencies.
-    summary.md is a compact Markdown summary for pasting into Jira/GitHub comments.
-    """
-    output_dir = Path(output_dir)
-    by_title = OrderedDict()
-    for s in summary:
-        title = s.get('title', s.get('name', 'Unknown'))
-        by_title.setdefault(title, []).append(s)
 
-    # Summary table
+def _table_badge(status, pct, split_children):
+    """Return (badge_html, detail_html) for a summary table row."""
+    if status == 'identical':
+        return '<span class="badge-identical">identical</span>', ''
+    if status == 'changed':
+        return f'<span class="badge-changed">CHANGED ({pct:.1f}%)</span>', None  # detail built by caller
+    if status == 'new':
+        return '<span class="badge-new">NEW</span>', None
+    if status == 'removed':
+        return '<span class="badge-removed">REMOVED</span>', None
+    if status == 'renamed':
+        return f'<span class="badge-renamed">RENAMED ({pct:.1f}%)</span>', None
+    if status == 'split':
+        n = len(split_children or [])
+        return f'<span class="badge-split">SPLIT → {n} chapters</span>', None
+    if status == 'error':
+        return '<span class="badge-error">error</span>', None
+    return '<span class="badge-skipped">skipped</span>', None
+
+
+def _build_table_rows(by_title):
+    """Return list of <tr> HTML strings for the summary table."""
     rows = []
     for title, items in by_title.items():
         for s in items:
             chapter = s.get('chapter', '')
             status  = s.get('status', 'unknown')
             slug    = s.get('slug', slugify(title))
-            if status == 'identical':
-                badge, detail = '<span class="badge-identical">identical</span>', ''
-            elif status == 'changed':
-                pct = s.get('change_pct', 0)
-                badge  = f'<span class="badge-changed">CHANGED ({pct:.1f}%)</span>'
-                detail = f'<a href="#{slug}">view</a>'
-            elif status == 'new':
-                badge, detail = '<span class="badge-new">NEW</span>', f'<a href="#{slug}">view</a>'
-            elif status == 'removed':
-                badge, detail = '<span class="badge-removed">REMOVED</span>', f'<a href="#{slug}">view</a>'
-            elif status == 'renamed':
-                pct = s.get('change_pct', 0)
-                badge  = f'<span class="badge-renamed">RENAMED ({pct:.1f}%)</span>'
-                detail = f'<a href="#{slug}">view</a>'
-            elif status == 'split':
-                n = len(s.get('split_children', []))
-                badge  = f'<span class="badge-split">SPLIT → {n} chapters</span>'
-                detail = f'<a href="#{slug}">view</a>'
-            elif status == 'error':
-                badge, detail = '<span class="badge-error">error</span>', s.get('detail', '')
+            pct     = s.get('change_pct', 0)
+            badge, _detail = _table_badge(status, pct, s.get('split_children'))
+
+            if status == 'error':
+                detail = s.get('detail', '')
+            elif status in ('identical', 'skipped'):
+                detail = ''
             else:
-                badge, detail = '<span class="badge-skipped">skipped</span>', s.get('detail', '')
+                detail = f'<a href="#{slug}">view</a>'
+
             chapter_cell = chapter if chapter else '<em>(index)</em>'
             rows.append(f'<tr><td>{title}</td><td>{chapter_cell}</td><td>{badge}</td><td>{detail}</td></tr>')
+    return rows
 
-    # Counts for summary
-    changed_count   = sum(1 for s in summary if s.get('status') == 'changed')
-    renamed_count   = sum(1 for s in summary if s.get('status') == 'renamed')
-    split_count     = sum(1 for s in summary if s.get('status') == 'split')
-    new_count       = sum(1 for s in summary if s.get('status') == 'new')
-    removed_count   = sum(1 for s in summary if s.get('status') == 'removed')
-    identical_count = sum(1 for s in summary if s.get('status') == 'identical')
-    errors_count    = sum(1 for s in summary if s.get('status') in ('error', 'skipped'))
 
-    # Detail sections + markdown
-    details  = []
-    md_lines = [
-        f"# Visual Diff: {label_a} vs {label_b}\n\n",
-        f"**{changed_count} changed, {renamed_count} renamed, {split_count} split, "
-        f"{new_count} new, {removed_count} removed** | {identical_count} identical | {errors_count} errors\n\n",
-    ]
-
-    for title, items in by_title.items():
-        notable = [s for s in items if s.get('status') in ('changed', 'renamed', 'split', 'new', 'removed')]
-        if not notable:
-            continue
-
-        details.append(f'<details open><summary class="title-summary">{title}</summary>')
-        for s in notable:
-            slug    = s.get('slug', '')
-            chapter = s.get('chapter', '')
-            status  = s.get('status', '')
-            pct     = s.get('change_pct', 0)
-            a_url   = s.get('a_url', '')
-            b_url   = s.get('b_url', '')
-            chapter_title = f"{title} / {chapter}" if chapter else title
-
-            if status == 'new':
-                b_png = output_dir / f"{slug}_b.png"
-                b_src = _img_to_data_uri(b_png) if b_png.exists() else ''
-                b_img = f'<img src="{b_src}" alt="{label_b}">' if b_src else '<em>no screenshot</em>'
-                details.append(f'''
+def _section_new(s, output_dir, label_b):
+    """Return (html_block, md_lines) for a 'new' page."""
+    slug    = s.get('slug', '')
+    b_url   = s.get('b_url', '')
+    chapter = s.get('chapter', '')
+    title   = s.get('title', '')
+    chapter_title = f"{title} / {chapter}" if chapter else title
+    b_img = _img_tag(output_dir / f"{slug}_b.png", label_b)
+    html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-new">NEW</span></h3>
               <p class="meta"><a href="{b_url}" target="_blank">{label_b}</a></p>
               <div class="screenshot-grid">
                 <div class="screenshot-col"><h4>{label_b}</h4>{b_img}</div>
               </div>
-            </div>''')
-                md_lines.append(f"## {chapter_title} *(new)*\n")
-                if b_url:
-                    md_lines.append(f"- [{label_b}]({b_url})\n")
-                md_lines.append("\n")
+            </div>'''
+    md = [f"## {chapter_title} *(new)*\n"]
+    if b_url:
+        md.append(f"- [{label_b}]({b_url})\n")
+    md.append("\n")
+    return html, md
 
-            elif status == 'removed':
-                a_png = output_dir / f"{slug}_a.png"
-                a_src = _img_to_data_uri(a_png) if a_png.exists() else ''
-                a_img = f'<img src="{a_src}" alt="{label_a}">' if a_src else '<em>no screenshot</em>'
-                details.append(f'''
+
+def _section_removed(s, output_dir, label_a):
+    """Return (html_block, md_lines) for a 'removed' page."""
+    slug    = s.get('slug', '')
+    a_url   = s.get('a_url', '')
+    chapter = s.get('chapter', '')
+    title   = s.get('title', '')
+    chapter_title = f"{title} / {chapter}" if chapter else title
+    a_img = _img_tag(output_dir / f"{slug}_a.png", label_a)
+    html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-removed">REMOVED</span></h3>
               <p class="meta"><a href="{a_url}" target="_blank">{label_a}</a></p>
               <div class="screenshot-grid">
                 <div class="screenshot-col"><h4>{label_a}</h4>{a_img}</div>
               </div>
-            </div>''')
-                md_lines.append(f"## {chapter_title} *(removed)*\n")
-                if a_url:
-                    md_lines.append(f"- [{label_a}]({a_url})\n")
-                md_lines.append("\n")
+            </div>'''
+    md = [f"## {chapter_title} *(removed)*\n"]
+    if a_url:
+        md.append(f"- [{label_a}]({a_url})\n")
+    md.append("\n")
+    return html, md
 
-            elif status == 'split':
-                a_png = output_dir / f"{slug}_a.png"
-                a_src = _img_to_data_uri(a_png) if a_png.exists() else ''
-                a_img = f'<img src="{a_src}" alt="{label_a}">' if a_src else '<em>no screenshot</em>'
-                children = s.get('split_children', [])
-                children_html = ''.join(f'<li>{c}</li>' for c in children)
-                details.append(f'''
+
+def _section_split(s, output_dir, label_a, label_b):
+    """Return (html_block, md_lines) for a 'split' page."""
+    slug     = s.get('slug', '')
+    a_url    = s.get('a_url', '')
+    chapter  = s.get('chapter', '')
+    title    = s.get('title', '')
+    children = s.get('split_children', [])
+    chapter_title  = f"{title} / {chapter}" if chapter else title
+    children_html  = ''.join(f'<li>{c}</li>' for c in children)
+    a_img = _img_tag(output_dir / f"{slug}_a.png", label_a)
+    html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-split">SPLIT</span></h3>
               <p class="meta">Sections promoted to top-level chapters in {label_b}</p>
@@ -142,26 +134,38 @@ def generate_report(output_dir, summary, label_a="Before", label_b="After"):
               <div class="screenshot-grid">
                 <div class="screenshot-col"><h4>{label_a} (original)</h4>{a_img}</div>
               </div>
-            </div>''')
-                md_lines.append(f"## {chapter_title} *(split → {len(children)} chapters)*\n")
-                if a_url:
-                    md_lines.append(f"- [{label_a}]({a_url})\n")
-                for c in children:
-                    md_lines.append(f"  - {c}\n")
-                md_lines.append("\n")
+            </div>'''
+    md = [f"## {chapter_title} *(split → {len(children)} chapters)*\n"]
+    if a_url:
+        md.append(f"- [{label_a}]({a_url})\n")
+    for c in children:
+        md.append(f"  - {c}\n")
+    md.append("\n")
+    return html, md
 
-            elif status == 'renamed':
-                a_png = output_dir / f"{slug}_a_annotated.png"
-                b_png = output_dir / f"{slug}_b_annotated.png"
-                if not a_png.exists():
-                    a_png = output_dir / f"{slug}_a.png"
-                if not b_png.exists():
-                    b_png = output_dir / f"{slug}_b.png"
-                a_src = _img_to_data_uri(a_png) if a_png.exists() else ''
-                b_src = _img_to_data_uri(b_png) if b_png.exists() else ''
-                a_img = f'<img src="{a_src}" alt="{label_a}">' if a_src else '<em>no screenshot</em>'
-                b_img = f'<img src="{b_src}" alt="{label_b}">' if b_src else '<em>no screenshot</em>'
-                details.append(f'''
+
+def _annotated_img_tags(output_dir, slug, label_a, label_b):
+    """Return (a_img, b_img) using annotated PNGs, falling back to raw."""
+    a_png = output_dir / f"{slug}_a_annotated.png"
+    b_png = output_dir / f"{slug}_b_annotated.png"
+    if not a_png.exists():
+        a_png = output_dir / f"{slug}_a.png"
+    if not b_png.exists():
+        b_png = output_dir / f"{slug}_b.png"
+    return _img_tag(a_png, label_a), _img_tag(b_png, label_b)
+
+
+def _section_renamed(s, output_dir, label_a, label_b):
+    """Return (html_block, md_lines) for a 'renamed' page."""
+    slug    = s.get('slug', '')
+    a_url   = s.get('a_url', '')
+    b_url   = s.get('b_url', '')
+    chapter = s.get('chapter', '')
+    title   = s.get('title', '')
+    pct     = s.get('change_pct', 0)
+    chapter_title = f"{title} / {chapter}" if chapter else title
+    a_img, b_img = _annotated_img_tags(output_dir, slug, label_a, label_b)
+    html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title} <span class="badge-renamed">RENAMED</span></h3>
               <p class="meta">
@@ -173,23 +177,30 @@ def generate_report(output_dir, summary, label_a="Before", label_b="After"):
                 <div class="screenshot-col"><h4>{label_a}</h4>{a_img}</div>
                 <div class="screenshot-col"><h4>{label_b}</h4>{b_img}</div>
               </div>
-            </div>''')
-                md_lines.append(f"## {chapter_title} *(renamed)*\n")
-                md_lines.append(f"- Change: {pct:.2f}%\n")
-                if a_url:
-                    md_lines.append(f"- [{label_a}]({a_url})\n")
-                if b_url:
-                    md_lines.append(f"- [{label_b}]({b_url})\n")
-                md_lines.append("\n")
+            </div>'''
+    md = [f"## {chapter_title} *(renamed)*\n", f"- Change: {pct:.2f}%\n"]
+    if a_url:
+        md.append(f"- [{label_a}]({a_url})\n")
+    if b_url:
+        md.append(f"- [{label_b}]({b_url})\n")
+    md.append("\n")
+    return html, md
 
-            else:  # changed
-                a_png = output_dir / f"{slug}_a_annotated.png"
-                b_png = output_dir / f"{slug}_b_annotated.png"
-                a_src = _img_to_data_uri(a_png) if a_png.exists() else ''
-                b_src = _img_to_data_uri(b_png) if b_png.exists() else ''
-                a_img = f'<img src="{a_src}" alt="{label_a}">' if a_src else '<em>no screenshot</em>'
-                b_img = f'<img src="{b_src}" alt="{label_b}">' if b_src else '<em>no screenshot</em>'
-                details.append(f'''
+
+def _section_changed(s, output_dir, label_a, label_b):
+    """Return (html_block, md_lines) for a 'changed' page."""
+    slug    = s.get('slug', '')
+    a_url   = s.get('a_url', '')
+    b_url   = s.get('b_url', '')
+    chapter = s.get('chapter', '')
+    title   = s.get('title', '')
+    pct     = s.get('change_pct', 0)
+    chapter_title = f"{title} / {chapter}" if chapter else title
+    a_png = output_dir / f"{slug}_a_annotated.png"
+    b_png = output_dir / f"{slug}_b_annotated.png"
+    a_img = _img_tag(a_png, label_a)
+    b_img = _img_tag(b_png, label_b)
+    html = f'''
             <div class="chapter-section" id="{slug}">
               <h3>{chapter_title}</h3>
               <p class="meta">
@@ -201,18 +212,49 @@ def generate_report(output_dir, summary, label_a="Before", label_b="After"):
                 <div class="screenshot-col"><h4>{label_a}</h4>{a_img}</div>
                 <div class="screenshot-col"><h4>{label_b}</h4>{b_img}</div>
               </div>
-            </div>''')
-                md_lines.append(f"## {chapter_title}\n")
-                md_lines.append(f"- Change: {pct:.2f}%\n")
-                if a_url:
-                    md_lines.append(f"- [{label_a}]({a_url})\n")
-                if b_url:
-                    md_lines.append(f"- [{label_b}]({b_url})\n")
-                md_lines.append("\n")
+            </div>'''
+    md = [f"## {chapter_title}\n", f"- Change: {pct:.2f}%\n"]
+    if a_url:
+        md.append(f"- [{label_a}]({a_url})\n")
+    if b_url:
+        md.append(f"- [{label_b}]({b_url})\n")
+    md.append("\n")
+    return html, md
 
+
+_SECTION_BUILDERS = {
+    'new':     _section_new,
+    'removed': _section_removed,
+    'split':   _section_split,
+    'renamed': _section_renamed,
+    'changed': _section_changed,
+}
+
+
+def _build_details(by_title, output_dir, label_a, label_b):
+    """Return (details_html_list, md_lines) for all notable pages."""
+    details  = []
+    md_lines = []
+    for title, items in by_title.items():
+        notable = [s for s in items if s.get('status') in _SECTION_BUILDERS]
+        if not notable:
+            continue
+        details.append(f'<details open><summary class="title-summary">{title}</summary>')
+        for s in notable:
+            status  = s.get('status')
+            builder = _SECTION_BUILDERS[status]
+            if status in ('new', 'removed'):
+                html_block, md = builder(s, output_dir, label_a if status == 'removed' else label_b)
+            else:
+                html_block, md = builder(s, output_dir, label_a, label_b)
+            details.append(html_block)
+            md_lines.extend(md)
         details.append('</details>')
+    return details, md_lines
 
-    html = f'''<!DOCTYPE html>
+
+_HTML_TEMPLATE = '''\
+<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Visual Diff: {label_a} vs {label_b}</title>
 <style>
@@ -252,16 +294,56 @@ def generate_report(output_dir, summary, label_a="Before", label_b="After"):
 <h1>Visual Diff Report</h1>
 <p style="color:#586069;">
   Comparing <strong>{label_a}</strong> vs <strong>{label_b}</strong> &mdash;
-  {changed_count} changed, {renamed_count} renamed, {split_count} split, {new_count} new,
-  {removed_count} removed, {identical_count} identical, {errors_count} errors
+  {changed} changed, {renamed} renamed, {split} split, {new} new,
+  {removed} removed, {identical} identical, {errors} errors
 </p>
 <table>
 <tr><th>Title</th><th>Chapter</th><th>Status</th><th>Details</th></tr>
-{"".join(rows)}
+{rows}
 </table>
 <hr style="border:none;border-top:2px solid #e1e4e8;margin:30px 0;">
-{"".join(details)}
+{details}
 </body></html>'''
+
+
+def generate_report(output_dir, summary, label_a="Before", label_b="After"):
+    """Generate index.html (self-contained, inline images) and summary.md.
+
+    index.html embeds all annotated PNGs as base64 data URIs so the file
+    can be shared or attached without external dependencies.
+    summary.md is a compact Markdown summary for pasting into Jira/GitHub comments.
+    """
+    output_dir = Path(output_dir)
+    by_title = OrderedDict()
+    for s in summary:
+        title = s.get('title', s.get('name', 'Unknown'))
+        by_title.setdefault(title, []).append(s)
+
+    rows    = _build_table_rows(by_title)
+    details, detail_md = _build_details(by_title, output_dir, label_a, label_b)
+
+    changed  = sum(1 for s in summary if s.get('status') == 'changed')
+    renamed  = sum(1 for s in summary if s.get('status') == 'renamed')
+    split    = sum(1 for s in summary if s.get('status') == 'split')
+    new      = sum(1 for s in summary if s.get('status') == 'new')
+    removed  = sum(1 for s in summary if s.get('status') == 'removed')
+    identical = sum(1 for s in summary if s.get('status') == 'identical')
+    errors   = sum(1 for s in summary if s.get('status') in ('error', 'skipped'))
+
+    html = _HTML_TEMPLATE.format(
+        label_a=label_a, label_b=label_b,
+        changed=changed, renamed=renamed, split=split,
+        new=new, removed=removed, identical=identical, errors=errors,
+        rows="\n".join(rows),
+        details="\n".join(details),
+    )
+
+    md_lines = [
+        f"# Visual Diff: {label_a} vs {label_b}\n\n",
+        f"**{changed} changed, {renamed} renamed, {split} split, "
+        f"{new} new, {removed} removed** | {identical} identical | {errors} errors\n\n",
+        *detail_md,
+    ]
 
     (output_dir / 'index.html').write_text(html, encoding='utf-8')
     (output_dir / 'summary.md').write_text(''.join(md_lines), encoding='utf-8')
