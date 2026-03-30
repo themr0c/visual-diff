@@ -60,7 +60,6 @@ CONTENT_BASE = {
     'preview': 'https://content-preview.docs.redhat.com',
 }
 
-GITHUB_PAGES_BASE = "https://redhat-developer.github.io/red-hat-developers-documentation-rhdh"
 
 # CSS selectors tried in order to find the main content area (nav/sidebar excluded)
 CONTENT_SELECTORS = [
@@ -135,7 +134,10 @@ def resolve_pr_envs(args):
     if not env_b:
         base_ref = os.environ.get('GITHUB_BASE_REF')
         if base_ref:
-            env_b = f"{GITHUB_PAGES_BASE}/{base_ref}/"
+            pages_base = os.environ.get('GITHUB_PAGES_BASE')
+            if not pages_base:
+                sys.exit("Error: --env-b is required in PR mode (or set GITHUB_BASE_REF + GITHUB_PAGES_BASE env vars)")
+            env_b = f"{pages_base.rstrip('/')}/{base_ref}/"
         else:
             sys.exit("Error: --env-b is required in PR mode (or set GITHUB_BASE_REF)")
 
@@ -149,6 +151,10 @@ def resolve_before_after_urls(args):
     PR:       before=env_a, after=env_b
     """
     if args.mode == 'pantheon':
+        if not args.pantheon_product:
+            sys.exit("Error: --pantheon-product (or $PANTHEON_PRODUCT) is required in pantheon mode")
+        if not args.pantheon_version:
+            sys.exit("Error: --pantheon-version (or $PANTHEON_VERSION) is required in pantheon mode")
         return (
             splash_url('stage',   args.pantheon_product, args.pantheon_version),
             splash_url('preview', args.pantheon_product, args.pantheon_version),
@@ -981,6 +987,8 @@ def cmd_compare(args):
 
     if is_pantheon and not version:
         sys.exit("Error: --pantheon-version (or $PANTHEON_VERSION) required for compare in pantheon mode")
+    if is_pantheon and not product:
+        sys.exit("Error: --pantheon-product (or $PANTHEON_PRODUCT) required for compare in pantheon mode")
 
     pairs = find_page_pairs(
         before_dir, after_dir,
@@ -1151,9 +1159,9 @@ Modes:
   pr        Compare two arbitrary builds (ccutil output, GitHub Pages, localhost).
 
 Examples:
-  visual-diff diff --pantheon-version 1.9 --output /tmp/rhdh-1.9-diff/ --headless
+  visual-diff diff --pantheon-version 1.9 --output /tmp/diff-output/ --headless
   visual-diff fetch --pantheon-version 1.9
-  visual-diff compare --output /tmp/rhdh-1.9-diff/ --headless
+  visual-diff compare --output /tmp/diff-output/ --headless
   visual-diff diff --mode pr --env-a ./build/ --env-b https://example.com/ --output /tmp/pr-diff/
   visual-diff urls --pantheon-version 1.9
 """,
@@ -1173,8 +1181,8 @@ Examples:
 
     pantheon_opts = argparse.ArgumentParser(add_help=False)
     pantheon_opts.add_argument(
-        "--pantheon-product", default=os.getenv("PANTHEON_PRODUCT", "red_hat_developer_hub"),
-        help="Product slug (default: $PANTHEON_PRODUCT or red_hat_developer_hub)",
+        "--pantheon-product", default=os.getenv("PANTHEON_PRODUCT"),
+        help="Product slug (default: $PANTHEON_PRODUCT)",
     )
     pantheon_opts.add_argument(
         "--pantheon-version", default=os.getenv("PANTHEON_VERSION"),
