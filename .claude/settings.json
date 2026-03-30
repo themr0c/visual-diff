@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(scripts/visual-diff:*)",
+      "Bash(./setup.sh)",
+      "Bash(wget:*)",
+      "Bash(venv/bin/playwright install:*)",
+      "Bash(chmod +x scripts/visual-diff)",
+      "Bash(klist)"
+    ]
+  }
+}
